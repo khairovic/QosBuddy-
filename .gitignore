@@ -7,3 +7,5 @@ mlflow/
 .DS_Store
 .env
 *.log
+outputs/
+*.pkl
