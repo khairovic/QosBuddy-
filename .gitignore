@@ -1,0 +1,9 @@
+chroma_store/ 
+__pycache__/ 
+.venv/ 
+*.pyc 
+data/*.xls 
+data/*.csv 
+data/*.pdf 
+anaconda_projects/ 
+.ipynb_checkpoints/ 

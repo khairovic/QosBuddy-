@@ -1,0 +1,87 @@
+# QoSBuddy M6 — Docker Compose Stack
+
+services:
+
+  # ── 1. Ollama — local LLM server ──────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: qosbuddy-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_models:/root/.ollama
+    restart: unless-stopped
+
+  # ── 2. KB builder — runs once then exits ──────────────────────────────────
+  kb-builder:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: qosbuddy-kb-builder
+    command: >
+      sh -c "
+        echo 'Waiting 20s for Ollama...' &&
+        sleep 20 &&
+        python rag/build_knowledge_base.py
+      "
+    environment:
+      - QOSBUDDY_DATA_DIR=/app/data
+      - QOSBUDDY_CHROMA_DIR=/app/chroma_store
+      - OLLAMA_HOST=http://ollama:11434
+    volumes:
+      - ./data:/app/data:ro
+      - chroma_store:/app/chroma_store
+    depends_on:
+      - ollama
+    restart: "no"
+
+  # ── 3. FastAPI backend ────────────────────────────────────────────────────
+  qosbuddy-api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: qosbuddy-api
+    command: uvicorn api.fastapi_backend:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data:ro
+      - chroma_store:/app/chroma_store
+    environment:
+      - QOSBUDDY_DATA_DIR=/app/data
+      - QOSBUDDY_CHROMA_DIR=/app/chroma_store
+      - OLLAMA_BASE_URL=http://ollama:11434
+    depends_on:
+      kb-builder:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # ── 4. Streamlit dashboard ────────────────────────────────────────────────
+  qosbuddy-dashboard:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: qosbuddy-dashboard
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./data:/app/data:ro
+      - chroma_store:/app/chroma_store
+    environment:
+      - QOSBUDDY_DATA_DIR=/app/data
+      - QOSBUDDY_CHROMA_DIR=/app/chroma_store
+      - OLLAMA_BASE_URL=http://ollama:11434
+    depends_on:
+      qosbuddy-api:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  ollama_models:
+  chroma_store:
