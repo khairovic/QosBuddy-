@@ -7,3 +7,7 @@ mlflow/
 .DS_Store
 .env
 *.log
+chroma_store/
+*.bak
+.ipynb_checkpoints/
+anaconda_projects/
