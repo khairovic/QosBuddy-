@@ -160,10 +160,8 @@ def load_counterfactual_data() -> pd.DataFrame:
         return pd.DataFrame()
 
     df = pd.read_csv(path)
-    # Handle duplicate header rows if present
-    if "timestamp" in df.columns:
-        df = df[df["timestamp"] != "timestamp"].reset_index(drop=True)
-        df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce").fillna(1).astype(int)
+    df = df[df["timestamp"] != "timestamp"].reset_index(drop=True)
+    df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce").fillna(1).astype(int)
     log.info(f"Counterfactual data: {df.shape}")
     return df
 

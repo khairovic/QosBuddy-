@@ -8,14 +8,14 @@ openpyxl>=3.1.0          # xlsx reading
 pypdf>=4.0.0             # PDF text extraction for domain context docs
 
 # ── Embeddings & Vector DB ─────────────────────────────────────────────────────
-sentence-transformers>=3.0.0   # all-MiniLM-L6-v2 local embedding model
+sentence-transformers>=3.0.0   # all-MiniLM-L6-v2 + cross-encoder reranking
 chromadb>=0.5.0                # persistent local vector store
 
 # ── LangChain RAG stack ────────────────────────────────────────────────────────
 langchain>=0.2.0
 langchain-core>=0.2.0
 langchain-community>=0.2.0
-langchain-ollama>=0.1.0        # Ollama integration (llama3.2 / mistral)
+langchain-ollama>=0.1.0        # Ollama integration (llama3.2)
 
 # ── Dashboard ──────────────────────────────────────────────────────────────────
 streamlit>=1.35.0
@@ -25,6 +25,12 @@ plotly>=5.20.0
 fastapi>=0.111.0
 uvicorn[standard]>=0.30.0
 pydantic>=2.7.0
+requests>=2.31.0               # streaming RAG endpoint calls Ollama directly
+
+# ── M6 AI Improvements ─────────────────────────────────────────────────────────
+rank-bm25>=0.2.2               # Improvement #1: BM25 sparse retrieval
+scikit-learn>=1.4.0            # Improvement #5: IsolationForest for SHAP
+shap>=0.44.0                   # Improvement #5: SHAP explainability (XAI)
 
 # ── PDF export ─────────────────────────────────────────────────────────────────
 reportlab>=4.2.0

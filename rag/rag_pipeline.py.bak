@@ -38,8 +38,8 @@ EMBED_MODEL     = "all-MiniLM-L6-v2"
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_MODEL    = "llama3.2"
 
-TOP_K_RETRIEVAL   = 8
-MAX_CONTEXT_CHARS = 8000
+TOP_K_RETRIEVAL   = 6
+MAX_CONTEXT_CHARS = 6000
 
 
 # ─────────────────────────────────────────────
@@ -61,77 +61,8 @@ def get_embed_model() -> SentenceTransformer:
 
 
 # ─────────────────────────────────────────────
-# 2. Smart Query Processing
+# 2. Retrieval
 # ─────────────────────────────────────────────
-
-import re
-
-# Keywords that help auto-detect retrieval mode
-_MODE_KEYWORDS = {
-    "anomaly":  ["anomaly", "anomalies", "alert", "alerts", "abnormal", "outlier",
-                 "detection", "detected", "score", "scores", "flagged"],
-    "causal":   ["root cause", "cause", "why", "reason", "causal", "dowhy",
-                 "chain", "because", "due to", "explain why"],
-    "sla":      ["sla", "breach", "violation", "risk", "prediction", "threshold",
-                 "service level", "compliance"],
-    "model_comparison": ["model", "models", "compare", "comparison", "best model",
-                         "accuracy", "benchmark", "isolation forest", "xgboost",
-                         "lstm", "copod", "ocsvm", "random forest", "gradient",
-                         "transformer", "tranad"],
-}
-
-def auto_detect_mode(question: str, explicit_mode: str = "general") -> str:
-    """Auto-detect the best retrieval mode from the question if mode is general."""
-    if explicit_mode != "general":
-        return explicit_mode
-
-    q_lower = question.lower()
-    best_mode = "general"
-    best_score = 0
-
-    for mode, keywords in _MODE_KEYWORDS.items():
-        score = sum(1 for kw in keywords if kw in q_lower)
-        if score > best_score:
-            best_score = score
-            best_mode = mode
-
-    return best_mode if best_score >= 1 else "general"
-
-
-def expand_query(question: str) -> str:
-    """
-    Expand short or vague questions into richer queries for better semantic retrieval.
-    This helps ChromaDB find more relevant documents.
-    """
-    q = question.strip()
-    q_lower = q.lower()
-
-    # Already a good query — don't modify
-    if len(q.split()) >= 8:
-        return q
-
-    # Expand common short patterns
-    expansions = {
-        "packet loss":    "packet loss ratio anomaly root cause severity KPI degradation",
-        "congestion":     "network congestion high load traffic root cause remediation",
-        "throughput":     "throughput degradation Mbps performance KPI anomaly",
-        "latency":        "latency delay_ms high latency degradation performance",
-        "sinr":           "SINR signal quality interference wireless channel degradation",
-        "handover":       "handover failure mobility interruption connection drops",
-        "sla":            "SLA breach violation risk prediction service level agreement",
-        "critical":       "critical severity high risk anomaly urgent alert remediation",
-        "root cause":     "root cause causal analysis DoWhy recommended action remediation",
-        "model":          "anomaly detection model comparison benchmark accuracy score",
-    }
-
-    expanded = q
-    for key, expansion in expansions.items():
-        if key in q_lower:
-            expanded = f"{q} {expansion}"
-            break
-
-    return expanded
-
 
 def retrieve_context(
     query: str,
@@ -206,40 +137,19 @@ def retrieve_context(
 
 
 def format_context_for_llm(retrieved_docs: List[Dict]) -> str:
-    """Assemble retrieved documents into a clean context string for the LLM."""
-    if not retrieved_docs:
-        return "[No relevant data found in the knowledge base]"
-
+    """Assemble retrieved documents into a context string for the LLM prompt."""
     parts = []
     for i, doc in enumerate(retrieved_docs, 1):
         sim = doc["similarity"]
-        meta = doc["metadata"]
-        dt   = meta.get("doc_type", "UNKNOWN")
-        ver  = meta.get("data_version", "")
+        dt  = doc["metadata"].get("doc_type", "UNKNOWN")
+        ver = doc["metadata"].get("data_version", "")
+        ver_tag = f" ({ver})" if ver else ""
+        parts.append(f"[Source {i} | {dt}{ver_tag} | similarity={sim:.3f}]\n{doc['document']}")
 
-        # Build a concise header
-        header_parts = [f"Source {i}", dt]
-        if ver:
-            header_parts.append(f"version={ver}")
-        # Add key metadata for anomaly events
-        if dt == "ANOMALY_EVENT":
-            if "window_idx" in meta:
-                header_parts.append(f"window={meta['window_idx']}")
-            if "severity" in meta:
-                header_parts.append(f"severity={meta['severity']}")
-            if "root_cause" in meta:
-                header_parts.append(f"cause={meta['root_cause']}")
-        elif dt == "SLA_RISK":
-            if "ue_id" in meta:
-                header_parts.append(f"UE={meta['ue_id']}")
-
-        header = " | ".join(header_parts)
-        parts.append(f"[{header} | relevance={sim:.2f}]\n{doc['document']}")
-
-    context = "\n\n---\n\n".join(parts)
+    context = "\n\n" + ("─" * 60) + "\n\n".join(parts)
 
     if len(context) > MAX_CONTEXT_CHARS:
-        context = context[:MAX_CONTEXT_CHARS] + "\n\n[...additional context omitted for brevity...]"
+        context = context[:MAX_CONTEXT_CHARS] + "\n\n[...context trimmed...]"
 
     return context
 
@@ -248,42 +158,40 @@ def format_context_for_llm(retrieved_docs: List[Dict]) -> str:
 # 3. LLM Integration
 # ─────────────────────────────────────────────
 
-NOC_SYSTEM_PROMPT = """You are QoSBuddy, an expert AI assistant for 5G network operations at a Network Operations Center (NOC).
+NOC_SYSTEM_PROMPT = """You are QoSBuddy NOC Assistant, an expert AI system for 5G network operations.
+You answer questions using ONLY the retrieved context provided. Your answers must be:
+  • Technical and precise — use real KPI values and model scores from the context
+  • Actionable — always recommend a concrete next step
+  • Structured — follow the exact output format below
 
-PERSONALITY:
-You are knowledgeable, clear, and helpful — like a senior network engineer explaining things to a colleague. You speak naturally and conversationally, not like a template. You adapt your tone: technical depth for expert questions, simple explanations for basic ones.
+The knowledge base contains data from multiple anomaly detection models:
+  - Classical: Isolation Forest, COPOD, One-Class SVM
+  - Supervised: Random Forest, XGBoost, Gradient Boosting
+  - Deep Learning: LSTM Autoencoder, Anomaly Transformer, TranAD
 
-KNOWLEDGE BASE:
-Your answers are grounded in retrieved context from QoSBuddy's monitoring system, which includes:
-  • 9 anomaly detection models: Isolation Forest, COPOD, One-Class SVM, Random Forest, XGBoost, Gradient Boosting, LSTM Autoencoder, Anomaly Transformer, TranAD
-  • Causal AI analysis (DoWhy) identifying root causes and causal chains
-  • SLA breach predictions from XGBoost early warning models
-  • Counterfactual analysis showing "what if" improvement estimates
-  • Severity triage and recommended remediation actions
+Root causes are identified by both Causal AI (DoWhy) and detection-based classification.
 
-RESPONSE GUIDELINES:
-1. READ the question carefully. Understand what the user actually wants — don't force a format on a simple question.
-2. For ALERT/ANOMALY questions, structure your answer with:
-   - What happened (which anomaly, affected windows/UEs, severity)
-   - Why it happened (root cause from causal analysis)
-   - What to do (specific remediation action)
-   - Expected impact (counterfactual improvement if available)
-   - Confidence level based on evidence strength
-3. For GENERAL/EXPLORATORY questions (e.g. "what is packet loss?", "how does the system work?", "explain congestion"), answer naturally in flowing paragraphs. Don't use the alert format.
-4. For COMPARISON questions (e.g. "which model is best?"), give a clear comparison with evidence from the context.
-5. Always cite specific numbers, scores, and model names from the context when available.
-6. If the context doesn't have enough information, say so honestly and suggest what the user could ask instead.
-7. NEVER invent KPI values, scores, or statistics not present in the context.
-8. Keep answers concise but complete — aim for 150-300 words unless the question demands more detail.
+OUTPUT FORMAT (always use these exact headers):
+**🚨 Alert Summary:**
+[1-2 sentences describing what anomaly was detected, which UEs/windows are affected, and severity]
+
+**✅ Recommended Action:**
+[specific technical action from root cause analysis — reference the causal chain]
+
+**📊 Counterfactual Impact:**
+[quantify the expected improvement if the recommended action is applied]
+
+**🎯 Confidence:** [HIGH / MEDIUM / LOW based on how much evidence is in the context]
+
+If the context does not contain enough information, say so clearly. Do not hallucinate KPI values.
 """
 
-NOC_HUMAN_TEMPLATE = """Here is the retrieved monitoring data from QoSBuddy's knowledge base:
-
+NOC_HUMAN_TEMPLATE = """Retrieved network context:
 {context}
 
-User question: {question}
+NOC Question: {question}
 
-Provide a clear, helpful answer based on the data above. Match your response style to what the user is asking — use structured alerts for anomaly questions, natural prose for explanations, and clear comparisons for comparison questions."""
+Answer following the structured output format:"""
 
 
 def build_langchain_rag_chain(
@@ -303,8 +211,8 @@ def build_langchain_rag_chain(
     llm = OllamaLLM(
         model=OLLAMA_MODEL,
         base_url=OLLAMA_BASE_URL,
-        temperature=0.3,
-        num_predict=1024,
+        temperature=0.1,
+        num_predict=512,
     )
 
     prompt = ChatPromptTemplate.from_messages([
@@ -367,7 +275,7 @@ def ask_ollama_direct(
             )},
         ],
         "stream": False,
-        "options": {"temperature": 0.3, "num_predict": 1024},
+        "options": {"temperature": 0.1, "num_predict": 512},
     }
 
     data = json.dumps(payload).encode()
@@ -402,40 +310,17 @@ def query_rag(
 ) -> Dict[str, Any]:
     """
     Unified RAG query interface used by Streamlit dashboard and FastAPI.
-    Now with smart query expansion and auto mode detection.
     Returns: { "answer": str, "sources": list, "question": str, "mode": str }
     """
-    # Smart mode detection
-    effective_mode = auto_detect_mode(question, mode)
-    log.info(f"Query: '{question}' | explicit_mode={mode} | effective_mode={effective_mode}")
-
-    # Expand query for better retrieval
-    expanded_query = expand_query(question)
-    if expanded_query != question:
-        log.info(f"Expanded query: '{expanded_query}'")
-
     docs = retrieve_context(
-        query=expanded_query,
+        query=question,
         collection=collection,
         embed_model=embed_model,
-        mode=effective_mode,
+        mode=mode,
         ue_id=ue_id,
         severity_filter=severity_filter,
         root_cause_filter=root_cause_filter,
     )
-
-    # If first retrieval returned low-relevance results, try broader search
-    if docs and all(d["similarity"] < 0.25 for d in docs) and effective_mode != "general":
-        log.info("Low relevance — retrying with general mode")
-        docs = retrieve_context(
-            query=expanded_query,
-            collection=collection,
-            embed_model=embed_model,
-            mode="general",
-            ue_id=ue_id,
-            n_results=TOP_K_RETRIEVAL,
-        )
-
     context = format_context_for_llm(docs)
 
     if chain is not None:

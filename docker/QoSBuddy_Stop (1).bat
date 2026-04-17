@@ -13,10 +13,11 @@ if exist "%SCRIPT_DIR%docker-compose.yml" (
     cd /d "%SCRIPT_DIR%"
 ) else if exist "%SCRIPT_DIR%docker\docker-compose.yml" (
     cd /d "%SCRIPT_DIR%docker\"
-) else if exist "%USERPROFILE%\Downloads\QosBuddy-\qosbuddy_m6\docker\docker-compose.yml" (
-    cd /d "%USERPROFILE%\Downloads\QosBuddy-\qosbuddy_m6\docker\"
+) else if exist "D:\QosBuddy\qosbuddy_m6\docker\docker-compose.yml" (
+    cd /d "D:\QosBuddy\qosbuddy_m6\docker\"
 ) else (
     echo  [ERROR] Could not find docker-compose.yml
+    echo  Make sure the project is at D:\QosBuddy\qosbuddy_m6\docker\
     pause
     exit /b 1
 )

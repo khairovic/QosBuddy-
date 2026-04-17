@@ -105,7 +105,7 @@ async def lifespan(app: FastAPI):
 
     # ── Load counterfactuals ──
     _cf_df = _safe_load_csv("counterfactuals.csv", "Counterfactuals")
-    if _cf_df is not None and "timestamp" in _cf_df.columns:
+    if _cf_df is not None:
         _cf_df = _cf_df[_cf_df["timestamp"] != "timestamp"].reset_index(drop=True)
         _cf_df["timestamp"] = pd.to_numeric(
             _cf_df["timestamp"], errors="coerce"
@@ -633,7 +633,6 @@ def get_voice_transcript():
     return result
 
 _voice_ui_state: dict = {"state": "idle", "answer_preview": ""}
-_voice_answer: dict = {"text": "", "ts": 0}
 
 @app.post("/voice/state")
 async def set_voice_state(payload: dict):
@@ -644,22 +643,6 @@ async def set_voice_state(payload: dict):
 @app.get("/voice/state")
 def get_voice_state():
     return dict(_voice_ui_state)
-
-@app.post("/voice/answer")
-async def post_voice_answer(payload: dict):
-    import time
-    _voice_answer["text"] = payload.get("text", "").strip()
-    _voice_answer["ts"]   = time.time()
-    return {"status": "ok"}
-
-@app.get("/voice/answer")
-def get_voice_answer():
-    """Return answer and clear it so it's only spoken once."""
-    result = dict(_voice_answer)
-    # Clear after read — prevents avatar from re-speaking the same answer
-    _voice_answer["text"] = ""
-    _voice_answer["ts"]   = 0
-    return result
 
 
 if __name__ == "__main__":

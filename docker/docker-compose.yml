@@ -31,6 +31,7 @@ services:
     volumes:
       - ./data:/app/data:ro
       - chroma_store:/app/chroma_store
+      - ../rag:/app/rag:ro
     depends_on:
       - ollama
     restart: "no"
@@ -47,6 +48,8 @@ services:
     volumes:
       - ./data:/app/data:ro
       - chroma_store:/app/chroma_store
+      - ../rag:/app/rag:ro
+      - ../api:/app/api:ro
     environment:
       - QOSBUDDY_DATA_DIR=/app/data
       - QOSBUDDY_CHROMA_DIR=/app/chroma_store
@@ -59,8 +62,8 @@ services:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 15s
       timeout: 10s
-      retries: 5
-      start_period: 30s
+      retries: 10
+      start_period: 120s
 
   # ── 4. Streamlit dashboard ────────────────────────────────────────────────
   qosbuddy-dashboard:
@@ -73,10 +76,13 @@ services:
     volumes:
       - ./data:/app/data:ro
       - chroma_store:/app/chroma_store
+      - ../rag:/app/rag:ro
+      - ../dashboard:/app/dashboard:ro
     environment:
       - QOSBUDDY_DATA_DIR=/app/data
       - QOSBUDDY_CHROMA_DIR=/app/chroma_store
       - OLLAMA_BASE_URL=http://ollama:11434
+      - QOSBUDDY_API_URL=http://qosbuddy-api:8000
     depends_on:
       qosbuddy-api:
         condition: service_healthy

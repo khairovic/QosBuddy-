@@ -1,28 +1,22 @@
 @echo off
+setlocal enabledelayedexpansion
 chcp 65001 >nul 2>&1
-title QoSBuddy NOC Dashboard — Launcher
+title QoSBuddy NOC Dashboard
 color 0B
 
 echo.
 echo  ╔══════════════════════════════════════════════════════════╗
 echo  ║                                                          ║
-echo  ║        ██████╗  ██████╗ ███████╗██████╗                  ║
-echo  ║       ██╔═══██╗██╔═══██╗██╔════╝██╔══██╗                ║
-echo  ║       ██║   ██║██║   ██║███████╗██████╔╝                ║
-echo  ║       ██║▄▄ ██║██║   ██║╚════██║██╔══██╗                ║
-echo  ║       ╚██████╔╝╚██████╔╝███████║██████╔╝                ║
-echo  ║        ╚══▀▀═╝  ╚═════╝ ╚══════╝╚═════╝                ║
-echo  ║                  B U D D Y                               ║
-echo  ║                                                          ║
+echo  ║              Q o S B u d d y                             ║
 echo  ║          PingWin · ESPRIT · 2025-2026                    ║
 echo  ║                                                          ║
 echo  ╚══════════════════════════════════════════════════════════╝
 echo.
 
-:: ── Check Docker is running ───────────────────────────────────────────
-echo  [1/4] Checking Docker...
+:: ── 1. Check Docker ───────────────────────────────────────────────────
+echo  [1/5] Checking Docker...
 docker info >nul 2>&1
-if %errorlevel% neq 0 (
+if !errorlevel! neq 0 (
     color 0C
     echo.
     echo  [ERROR] Docker is not running!
@@ -31,106 +25,111 @@ if %errorlevel% neq 0 (
     pause
     exit /b 1
 )
-echo        Docker is running.
+echo        OK - Docker is running.
+echo.
 
-:: ── Find the docker-compose directory ─────────────────────────────────
-:: Try to find the docker folder relative to where the .bat is placed
-set "SCRIPT_DIR=%~dp0"
+:: ── 2. Find docker-compose.yml ────────────────────────────────────────
+echo  [2/5] Finding project...
+set "COMPOSE_DIR="
 
-:: Option 1: .bat is inside qosbuddy_m6/docker/
-if exist "%SCRIPT_DIR%docker-compose.yml" (
-    set "COMPOSE_DIR=%SCRIPT_DIR%"
-    goto :found
+:: Check: .bat is inside docker/ folder
+if exist "%~dp0docker-compose.yml" (
+    set "COMPOSE_DIR=%~dp0"
 )
 
-:: Option 2: .bat is inside qosbuddy_m6/ (project root)
-if exist "%SCRIPT_DIR%docker\docker-compose.yml" (
-    set "COMPOSE_DIR=%SCRIPT_DIR%docker\"
-    goto :found
+:: Check: .bat is in project root, compose is in docker/
+if "!COMPOSE_DIR!"=="" if exist "%~dp0docker\docker-compose.yml" (
+    set "COMPOSE_DIR=%~dp0docker\"
 )
 
-:: Option 3: .bat is on Desktop or elsewhere — use known path
-if exist "%USERPROFILE%\Downloads\QosBuddy-\qosbuddy_m6\docker\docker-compose.yml" (
+:: Check: known path from your setup
+if "!COMPOSE_DIR!"=="" if exist "%USERPROFILE%\Downloads\QosBuddy-\qosbuddy_m6\docker\docker-compose.yml" (
     set "COMPOSE_DIR=%USERPROFILE%\Downloads\QosBuddy-\qosbuddy_m6\docker\"
-    goto :found
 )
 
-:: Not found — ask user
+if "!COMPOSE_DIR!"=="" (
+    color 0C
+    echo.
+    echo  [ERROR] Could not find docker-compose.yml
+    echo  Place this .bat file inside your qosbuddy_m6\docker\ folder
+    echo  (next to docker-compose.yml) and try again.
+    echo.
+    pause
+    exit /b 1
+)
+
+echo        OK - Found: !COMPOSE_DIR!
+echo.
+
+:: ── 3. Start services ─────────────────────────────────────────────────
+echo  [3/5] Starting all services (this may take 1-2 minutes)...
+echo        Building: Ollama, KB Builder, FastAPI, Dashboard...
+echo.
+
+cd /d "!COMPOSE_DIR!"
+docker compose up --build -d 2>&1
+
+if !errorlevel! neq 0 (
+    color 0C
+    echo.
+    echo  [ERROR] Docker Compose failed! Check the messages above.
+    echo.
+    pause
+    exit /b 1
+)
+
+echo.
+echo        OK - All containers started.
+echo.
+
+:: ── 4. Wait for dashboard ─────────────────────────────────────────────
+echo  [4/5] Waiting for dashboard to be ready...
+echo        (this can take 30-60 seconds on first run)
+echo.
+
+set "ATTEMPTS=0"
+
+:wait_loop
+set /a ATTEMPTS+=1
+
+:: Try to reach the dashboard
+curl -sf http://localhost:8501/_stcore/health >nul 2>&1
+if !errorlevel! equ 0 goto :dashboard_ready
+
+:: Also try the main page
+curl -sf -o nul http://localhost:8501/ >nul 2>&1
+if !errorlevel! equ 0 goto :dashboard_ready
+
+:: Not ready yet
+if !ATTEMPTS! geq 30 goto :dashboard_timeout
+
+echo        Attempt !ATTEMPTS!/30 - waiting...
+timeout /t 5 /nobreak >nul
+goto :wait_loop
+
+:dashboard_timeout
 color 0E
 echo.
-echo  [WARN] Could not auto-detect your project folder.
-echo  Please drag your "docker" folder here and press Enter:
-set /p "COMPOSE_DIR=  > "
-if not exist "%COMPOSE_DIR%docker-compose.yml" (
-    color 0C
-    echo  [ERROR] docker-compose.yml not found in: %COMPOSE_DIR%
-    pause
-    exit /b 1
-)
+echo  [WARN] Dashboard is taking longer than expected.
+echo         Opening browser anyway - it may need a few more seconds.
+echo.
+goto :open_browser
 
-:found
-echo        Project: %COMPOSE_DIR%
+:dashboard_ready
+echo.
+echo        OK - Dashboard is online!
 echo.
 
-:: ── Start the full stack ──────────────────────────────────────────────
-echo  [2/4] Building and starting all services...
-echo        (Ollama, KB Builder, FastAPI, Dashboard)
-echo        This may take a minute on first run...
+:: ── 5. Open browser ───────────────────────────────────────────────────
+:open_browser
+echo  [5/5] Opening dashboard in your browser...
 echo.
 
-cd /d "%COMPOSE_DIR%"
-docker compose up --build -d
-
-if %errorlevel% neq 0 (
-    color 0C
-    echo.
-    echo  [ERROR] Docker Compose failed. Check the output above.
-    echo.
-    pause
-    exit /b 1
-)
-
-:: ── Wait for dashboard to be ready ────────────────────────────────────
-echo.
-echo  [3/4] Waiting for dashboard to come online...
-
-set "READY=0"
-for /L %%i in (1,1,40) do (
-    if !READY! equ 0 (
-        curl -sf http://localhost:8501/_stcore/health >nul 2>&1
-        if !errorlevel! equ 0 (
-            set "READY=1"
-        ) else (
-            <nul set /p "=."
-            timeout /t 3 /nobreak >nul
-        )
-    )
-)
-
-:: Enable delayed expansion for the READY check
-setlocal enabledelayedexpansion
-set "READY=0"
-for /L %%i in (1,1,40) do (
-    if !READY! equ 0 (
-        curl -sf http://localhost:8501/_stcore/health >nul 2>&1
-        if !errorlevel! equ 0 (
-            set "READY=1"
-        ) else (
-            <nul set /p "=."
-            timeout /t 3 /nobreak >nul
-        )
-    )
-)
-endlocal & set "READY=%READY%"
-
-echo.
-
-:: ── Open browser ──────────────────────────────────────────────────────
-echo  [4/4] Opening dashboard in browser...
-echo.
+timeout /t 2 /nobreak >nul
 start "" http://localhost:8501
 
 color 0A
+echo.
 echo  ╔══════════════════════════════════════════════════════════╗
 echo  ║                                                          ║
 echo  ║   QoSBuddy is LIVE!                                      ║
@@ -139,20 +138,29 @@ echo  ║   Dashboard:  http://localhost:8501                       ║
 echo  ║   API Docs:   http://localhost:8000/docs                  ║
 echo  ║   Ollama:     http://localhost:11434                      ║
 echo  ║                                                          ║
-echo  ║   To stop: close this window or press Ctrl+C             ║
+echo  ╠══════════════════════════════════════════════════════════╣
+echo  ║                                                          ║
+echo  ║   Press any key to view live logs                        ║
+echo  ║   Press Ctrl+C then Y to stop everything                 ║
 echo  ║                                                          ║
 echo  ╚══════════════════════════════════════════════════════════╝
 echo.
+pause
 
-:: ── Stream logs until user stops ──────────────────────────────────────
-echo  Streaming logs... (press Ctrl+C to stop)
+:: ── Stream logs ───────────────────────────────────────────────────────
 echo.
-cd /d "%COMPOSE_DIR%"
-docker compose logs -f
+echo  Streaming logs (Ctrl+C to stop)...
+echo  ─────────────────────────────────────────────────────────────
+echo.
+cd /d "!COMPOSE_DIR!"
+docker compose logs -f --tail=50
 
-:: ── Cleanup on exit ───────────────────────────────────────────────────
+:: ── Cleanup ───────────────────────────────────────────────────────────
 echo.
-echo  Stopping QoSBuddy...
-docker compose down
-echo  Done. Goodbye!
+set /p "STOP=Stop all QoSBuddy services? (y/n): "
+if /i "!STOP!"=="y" (
+    echo  Stopping services...
+    docker compose down
+    echo  Done!
+)
 pause
