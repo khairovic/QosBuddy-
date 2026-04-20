@@ -450,6 +450,45 @@ def load_rl_df():
     except FileNotFoundError:
         return pd.DataFrame()
 
+# ── RL Agent API helpers (DSO3.1 live inference) ──
+RL_API_URL = os.getenv("QOSBUDDY_API_URL", "http://localhost:8000")
+
+def _rl_api_get(path: str, timeout: float = 5.0):
+    """GET wrapper for RL endpoints. Returns (data, error_message)."""
+    import urllib.request, urllib.error, json as _json
+    try:
+        with urllib.request.urlopen(f"{RL_API_URL}{path}", timeout=timeout) as r:
+            return _json.loads(r.read().decode("utf-8")), None
+    except urllib.error.HTTPError as e:
+        try:
+            detail = _json.loads(e.read().decode("utf-8")).get("detail", str(e))
+        except Exception:
+            detail = str(e)
+        return None, detail
+    except Exception as e:
+        return None, str(e)
+
+def _rl_api_post(path: str, payload: dict, timeout: float = 120.0):
+    """POST wrapper for RL endpoints."""
+    import urllib.request, urllib.error, json as _json
+    req = urllib.request.Request(
+        f"{RL_API_URL}{path}",
+        data=_json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return _json.loads(r.read().decode("utf-8")), None
+    except urllib.error.HTTPError as e:
+        try:
+            detail = _json.loads(e.read().decode("utf-8")).get("detail", str(e))
+        except Exception:
+            detail = str(e)
+        return None, detail
+    except Exception as e:
+        return None, str(e)
+
 @st.cache_resource(show_spinner=False)
 def get_rag_resources():
     try:
@@ -470,6 +509,7 @@ NAV_ITEMS = [
     ("kpi",       "📊", "KPI Overview"),
     ("anomaly",   "🚨", "Anomaly Feed"),
     ("causal",    "🔬", "Causal Analysis"),
+    ("forecast",  "🔮", "QoS Forecast"),
     ("sla_risk",  "⚠️",  "SLA Risk"),
     ("severity",  "🎯", "Severity Triage"),
     ("benchmark", "📈", "Benchmarking"),
@@ -533,6 +573,594 @@ def render_sidebar():
         </div>""", unsafe_allow_html=True)
 
     return st.session_state.get("page","voice")
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  COMPANION AVATAR — floating "Hey Buddy" assistant, docked bottom-right
+# ══════════════════════════════════════════════════════════════════════════════
+
+_COMPANION_LABELS = {
+    "kpi":       "KPI Overview",
+    "anomaly":   "Anomaly Feed",
+    "causal":    "Causal Analysis",
+    "forecast":  "QoS Forecast",
+    "sla_risk":  "SLA Risk",
+    "severity":  "Severity Triage",
+    "benchmark": "Benchmarking",
+    "rl":        "RL Actions",
+    "chat":      "Ask the Network",
+    "voice":     "Voice NOC",
+    "export":    "Export Report",
+}
+
+def render_companion(page_key: str):
+    """Inject a floating companion avatar at the bottom-right of the viewport.
+    The widget is rendered inside a Streamlit component iframe (same-origin)
+    and attaches itself to `window.parent.document.body` so it floats above
+    every dashboard page. Wake phrase: "Hey Buddy"."""
+    api_url   = RL_API_URL  # reuse configured backend URL
+    page_name = _COMPANION_LABELS.get(page_key, page_key.replace("_", " ").title())
+
+    html = _COMPANION_TEMPLATE.replace("__API_URL__", api_url) \
+                              .replace("__PAGE_KEY__", page_key) \
+                              .replace("__PAGE_NAME__", page_name)
+    # height=0 — the iframe itself is invisible; the widget lives in parent DOM.
+    st.components.v1.html(html, height=0, scrolling=False)
+
+
+_COMPANION_TEMPLATE = r"""
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><style>body{margin:0;padding:0}</style></head>
+<body>
+<script>
+(function() {
+  // Bail out if we can't reach the parent document (sandboxed).
+  var pdoc, pwin;
+  try { pwin = window.parent; pdoc = pwin.document; } catch(e) { return; }
+  if (!pdoc || !pdoc.body) return;
+
+  // Resolve API URL at runtime from the *browser's* location so this works
+  // identically on localhost, docker-host (port 8000 mapped), or a proxied deploy.
+  // Fallback to the server-rendered URL only if parent location is unavailable.
+  var API_URL = (function() {
+    try {
+      var loc = pwin.location;
+      return loc.protocol + "//" + loc.hostname + ":8000";
+    } catch(e) { return "__API_URL__"; }
+  })();
+
+  var PAGE_KEY  = "__PAGE_KEY__";
+  var PAGE_NAME = "__PAGE_NAME__";
+
+  // Persistent state namespace — survives iframe destruction on Streamlit reruns.
+  // Every mount refreshes the function closures on this object; the widget DOM
+  // in the parent reads from here via the rebound event listeners.
+  var S = pwin.__qbCompanion = pwin.__qbCompanion || {
+    wakeRec: null, askRec: null,
+    wakeActive: false, isListening: false, isSpeaking: false,
+    abortCtl: null,
+  };
+  S.pageKey  = PAGE_KEY;
+  S.pageName = PAGE_NAME;
+  S.apiUrl   = API_URL;
+
+  // ── Styles (scoped to #qb-companion) ─────────────────────────────────────
+  var style = pdoc.getElementById("qb-companion-style");
+  if (!style) {
+    style = pdoc.createElement("style");
+    style.id = "qb-companion-style";
+    pdoc.head.appendChild(style);
+  }
+  style.textContent = `
+    #qb-companion {
+      position: fixed; right: 22px; bottom: 22px; z-index: 2147483000;
+      font-family: 'IBM Plex Mono', ui-monospace, Menlo, monospace;
+      color: #e6f1ff;
+    }
+    #qb-companion *, #qb-companion *::before, #qb-companion *::after { box-sizing: border-box; }
+    #qb-companion-btn {
+      width: 68px; height: 68px; border-radius: 50%; cursor: pointer;
+      background: radial-gradient(circle at 30% 25%, rgba(0,229,160,0.45), rgba(0,212,255,0.35) 45%, rgba(8,12,18,0.92) 78%);
+      border: 1px solid rgba(0,212,255,0.45);
+      box-shadow: 0 10px 30px rgba(0,0,0,0.45),
+                  0 0 24px rgba(0,212,255,0.35),
+                  inset 0 0 18px rgba(0,229,160,0.18);
+      display: flex; align-items: center; justify-content: center;
+      transition: transform .18s ease, box-shadow .2s ease;
+      position: relative; overflow: visible;
+    }
+    #qb-companion-btn:hover { transform: translateY(-2px) scale(1.03); }
+    #qb-companion-head {
+      width: 44px; height: 44px; border-radius: 50%;
+      background: radial-gradient(circle at 32% 30%, #a7f3ff 0%, #00d4ff 32%, #0091b8 68%, #05202b 100%);
+      box-shadow: inset 0 0 14px rgba(255,255,255,0.25), 0 0 14px rgba(0,212,255,0.55);
+      position: relative;
+      animation: qbPulse 2.4s ease-in-out infinite;
+    }
+    #qb-companion-head::before, #qb-companion-head::after {
+      content: ""; position: absolute; top: 36%; width: 5px; height: 5px; border-radius: 50%;
+      background: #0a1929; box-shadow: 0 0 4px rgba(0,0,0,0.55);
+    }
+    #qb-companion-head::before { left: 28%; }
+    #qb-companion-head::after  { right: 28%; }
+    #qb-companion[data-state="listening"] #qb-companion-head { animation: qbRipple 0.9s ease-in-out infinite; }
+    #qb-companion[data-state="processing"] #qb-companion-head { animation: qbSpin 1.1s linear infinite; }
+    #qb-companion[data-state="speaking"] #qb-companion-head  { animation: qbTalk 0.34s ease-in-out infinite; }
+    @keyframes qbPulse  { 0%,100%{ transform: scale(1) } 50%{ transform: scale(1.06) } }
+    @keyframes qbRipple { 0%,100%{ box-shadow: 0 0 0 0 rgba(0,229,160,0.55) } 50%{ box-shadow: 0 0 0 14px rgba(0,229,160,0) } }
+    @keyframes qbSpin   { to { filter: hue-rotate(360deg) } }
+    @keyframes qbTalk   { 0%,100%{ transform: scaleY(1) } 50%{ transform: scaleY(0.86) } }
+    #qb-companion-status {
+      position: absolute; bottom: -3px; right: -3px; width: 16px; height: 16px;
+      border-radius: 50%; background: #00e5a0;
+      box-shadow: 0 0 6px #00e5a0; border: 2px solid #080c12;
+    }
+    #qb-companion[data-state="listening"]  #qb-companion-status { background: #ffb83f; box-shadow: 0 0 8px #ffb83f; }
+    #qb-companion[data-state="processing"] #qb-companion-status { background: #a78bfa; box-shadow: 0 0 8px #a78bfa; }
+    #qb-companion[data-state="speaking"]   #qb-companion-status { background: #ff4d6d; box-shadow: 0 0 8px #ff4d6d; }
+    #qb-companion[data-state="offline"]    #qb-companion-status { background: #4a5568; box-shadow: none; }
+
+    #qb-companion-panel {
+      position: absolute; right: 0; bottom: 82px; width: 360px;
+      background: rgba(8,12,18,0.88);
+      border: 1px solid rgba(0,212,255,0.25);
+      border-radius: 16px; padding: 16px 16px 12px;
+      backdrop-filter: blur(18px) saturate(140%);
+      box-shadow: 0 16px 44px rgba(0,0,0,0.55), 0 0 28px rgba(0,212,255,0.12);
+      transform-origin: bottom right;
+      transform: scale(0.88) translateY(8px); opacity: 0; pointer-events: none;
+      transition: transform .22s ease, opacity .22s ease;
+    }
+    #qb-companion.open #qb-companion-panel { transform: scale(1) translateY(0); opacity: 1; pointer-events: auto; }
+    #qb-companion-title {
+      font-size: 11px; letter-spacing: 0.18em; text-transform: uppercase;
+      color: rgba(0,212,255,0.75); margin-bottom: 6px;
+    }
+    #qb-companion-page {
+      font-family: 'Syne', system-ui, sans-serif; font-weight: 700;
+      font-size: 16px; color: #e6f1ff; margin-bottom: 2px;
+    }
+    #qb-companion-hint {
+      font-size: 10px; color: rgba(230,241,255,0.55); margin-bottom: 10px;
+    }
+    #qb-companion-transcript {
+      font-size: 12px; line-height: 1.45; color: #cbd5e1;
+      background: rgba(0,212,255,0.05); border: 1px dashed rgba(0,212,255,0.2);
+      border-radius: 10px; padding: 8px 10px; min-height: 38px; margin-bottom: 10px;
+      word-break: break-word;
+    }
+    #qb-companion-answer {
+      font-size: 12px; line-height: 1.5; color: #e6f1ff;
+      background: rgba(0,229,160,0.05); border: 1px solid rgba(0,229,160,0.22);
+      border-radius: 10px; padding: 8px 10px; max-height: 160px; overflow-y: auto;
+      margin-bottom: 10px; display: none;
+    }
+    #qb-companion-answer.visible { display: block; }
+    #qb-companion-controls { display: flex; gap: 8px; }
+    #qb-companion-controls button {
+      flex: 1; background: rgba(0,212,255,0.1); color: #e6f1ff;
+      border: 1px solid rgba(0,212,255,0.25); border-radius: 10px;
+      padding: 8px 10px; font-family: inherit; font-size: 11px;
+      text-transform: uppercase; letter-spacing: 0.12em; cursor: pointer;
+      transition: background .15s, border-color .15s;
+    }
+    #qb-companion-controls button:hover { background: rgba(0,212,255,0.2); border-color: rgba(0,212,255,0.5); }
+    #qb-companion-controls .primary {
+      background: linear-gradient(135deg, rgba(0,229,160,0.3), rgba(0,212,255,0.3));
+      border-color: rgba(0,229,160,0.45);
+    }
+    #qb-companion-close {
+      position: absolute; top: 8px; right: 10px; background: transparent; color: rgba(230,241,255,0.5);
+      border: none; font-size: 16px; cursor: pointer; line-height: 1;
+    }
+    #qb-companion-close:hover { color: #ff4d6d; }
+  `;
+
+  // ── Widget DOM ───────────────────────────────────────────────────────────
+  // Build once; subsequent mounts only update page context + rebind listeners.
+  var root = pdoc.getElementById("qb-companion");
+  if (!root) {
+    root = pdoc.createElement("div");
+    root.id = "qb-companion";
+    root.dataset.state = "idle";
+    root.innerHTML = `
+      <div id="qb-companion-panel" role="dialog" aria-label="QoSBuddy Companion">
+        <button id="qb-companion-close" title="Close" aria-label="Close">×</button>
+        <div id="qb-companion-title">QoSBuddy Companion</div>
+        <div id="qb-companion-page"></div>
+        <div id="qb-companion-hint">Say <b>"Hey Buddy"</b> or tap the mic to ask anything about this page.</div>
+        <div id="qb-companion-transcript">Listening for wake word…</div>
+        <div id="qb-companion-answer"></div>
+        <div id="qb-companion-controls">
+          <button class="primary" id="qb-companion-mic">🎙️ Ask</button>
+          <button id="qb-companion-stop">⏹ Stop</button>
+        </div>
+      </div>
+      <div id="qb-companion-btn" title="QoSBuddy companion — say &quot;Hey Buddy&quot;" role="button" tabindex="0" aria-label="Open QoSBuddy companion">
+        <div id="qb-companion-head"></div>
+        <div id="qb-companion-status"></div>
+      </div>
+    `;
+    pdoc.body.appendChild(root);
+  }
+  root.dataset.page = PAGE_KEY;
+  root.dataset.pageName = PAGE_NAME;
+
+  // Helpers that always re-query the DOM by id, so they work after rebind too.
+  function $id(id) { return pdoc.getElementById(id); }
+  function setState(s)     { root.dataset.state = s; }
+  function setTranscript(t){ var el = $id("qb-companion-transcript"); if (el) el.textContent = t; }
+  function setAnswer(t) {
+    var el = $id("qb-companion-answer");
+    if (!el) return;
+    el.textContent = t;
+    el.classList.toggle("visible", !!t);
+  }
+  function openPanel()  { root.classList.add("open"); }
+  function closePanel() { root.classList.remove("open"); }
+  function togglePanel() {
+    if (root.classList.contains("open")) closePanel(); else openPanel();
+  }
+
+  // Always show the *current* page name in the panel header.
+  var pageEl = $id("qb-companion-page");
+  if (pageEl) pageEl.textContent = PAGE_NAME;
+
+  // ── Speech stack ────────────────────────────────────────────────────────
+  var SR    = pwin.SpeechRecognition || pwin.webkitSpeechRecognition;
+  var synth = pwin.speechSynthesis;
+
+  if (!SR || !synth) {
+    setState("offline");
+    setTranscript("Voice needs Chrome + microphone permission.");
+    // Still rebind the click-to-open behavior so the panel is usable.
+    rebindButtons();
+    return;
+  }
+
+  var WAKE = ["hey buddy","hey body","hey budy","hey buddi","hey bud","hi buddy","ok buddy","okay buddy"];
+  function isWake(t) {
+    t = (t||"").toLowerCase().trim();
+    for (var i=0; i<WAKE.length; i++) if (t.indexOf(WAKE[i]) !== -1) return true;
+    return /\bhey\b/.test(t) && /\bbu|\bbo/.test(t);
+  }
+
+  // ── Voice interrupt commands ───────────────────────────────────────────
+  // Stop  = interrupt, KEEP remaining sentences so the user can resume.
+  // Resume= continue from where we paused.
+  var STOP_RE   = /\b(stop|halt|shut up|quiet|pause|enough|be quiet|hold on)\b/;
+  var RESUME_RE = /\b(continue|continu|proceed|keep going|go on|resume|carry on|the rest|rest please|finish it|keep talking|go ahead|please continue)\b/;
+
+  function wordCount(t) { return (t.trim().split(/\s+/).filter(Boolean)).length; }
+  function isStopCmd(t)   { return wordCount(t) <= 5 && STOP_RE.test(t); }
+  function isResumeCmd(t) { return wordCount(t) <= 6 && RESUME_RE.test(t); }
+
+  // Echo guard: if the recognized text is likely the mic picking up the
+  // assistant's own TTS output, ignore it (no false interrupts).
+  function isEcho(heard) {
+    if (!S.currentChunk) return false;
+    var hw = heard.split(/\s+/).filter(function(w){ return w.length > 2; });
+    if (hw.length < 2) return false;
+    var m = 0;
+    for (var i=0; i<hw.length; i++) if (S.currentChunk.indexOf(hw[i]) !== -1) m++;
+    return (m / hw.length) >= 0.55;
+  }
+
+  // Real question = at least 3 words and not a plain stop/resume command.
+  function looksLikeQuestion(t) {
+    return wordCount(t) >= 3 && !isStopCmd(t) && !isResumeCmd(t);
+  }
+
+  // ── Chunked speech synthesis so we can stop/resume between sentences ──
+  function splitIntoChunks(text) {
+    var clean = (text || "")
+      .replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/gu, "")
+      .replace(/\*\*/g, "")
+      .replace(/\r/g, "")
+      .trim();
+    var parts = clean.match(/[^.!?\u2026\n]+[.!?\u2026]+|[^.!?\u2026\n]+$/g) || [clean];
+    var out = [];
+    for (var i=0; i<parts.length; i++) {
+      var p = parts[i].trim();
+      if (!p) continue;
+      while (p.length > 220) {
+        var cut = p.lastIndexOf(" ", 200);
+        if (cut < 100) cut = 200;
+        out.push(p.slice(0, cut).trim());
+        p = p.slice(cut).trim();
+      }
+      if (p) out.push(p);
+    }
+    return out;
+  }
+
+  function pickVoice() {
+    var voices = synth.getVoices();
+    return voices.find(function(v){ return v.lang.startsWith("en") && (v.name.indexOf("Google")>=0 || v.name.indexOf("Natural")>=0); })
+        || voices.find(function(v){ return v.lang.startsWith("en"); });
+  }
+
+  function speak(text, done) {
+    if (!text) { if (done) done(); return; }
+    try { synth.cancel(); } catch(e) {}
+    S.pendingSpeech = splitIntoChunks(text);
+    S.speechDone    = done || null;
+    if (!S.pendingSpeech.length) { if (done) done(); return; }
+    setState("speaking");
+    S.isSpeaking = true;
+    // Keep the wake recognizer running during speech so we can catch
+    // "stop" / "continue" / or a whole new question without needing the wake word.
+    if (!S.wakeActive) setTimeout(startWake, 50);
+    speakNext();
+  }
+
+  function speakNext() {
+    if (!S.isSpeaking) return; // externally stopped
+    if (!S.pendingSpeech || !S.pendingSpeech.length) {
+      S.isSpeaking = false;
+      S.currentChunk = "";
+      setState("idle");
+      var d = S.speechDone; S.speechDone = null;
+      if (d) try { d(); } catch(e) {}
+      if (!S.wakeActive) setTimeout(startWake, 400);
+      return;
+    }
+    var chunk = S.pendingSpeech.shift();
+    S.currentChunk = chunk.toLowerCase();
+    var u = new pwin.SpeechSynthesisUtterance(chunk);
+    u.rate = 0.96; u.pitch = 1.02; u.volume = 1.0;
+    var pref = pickVoice();
+    if (pref) u.voice = pref;
+    u.onend   = function(){ if (S.isSpeaking) setTimeout(speakNext, 120); };
+    u.onerror = function(){ if (S.isSpeaking) setTimeout(speakNext, 120); };
+    try { synth.speak(u); }
+    catch(e) { if (S.isSpeaking) setTimeout(speakNext, 120); }
+  }
+
+  // Stop TTS. If keepPending=true, remaining sentences stay in the queue and
+  // can be resumed by saying "continue". Otherwise the queue is cleared.
+  function stopSpeaking(keepPending) {
+    try { synth.cancel(); } catch(e) {}
+    S.isSpeaking = false;
+    S.currentChunk = "";
+    if (!keepPending) S.pendingSpeech = [];
+    setState("idle");
+    if (S.pendingSpeech && S.pendingSpeech.length) {
+      setTranscript("Paused \u2014 say \u201Ccontinue\u201D to resume or ask a new question.");
+    }
+    if (!S.wakeActive) setTimeout(startWake, 150);
+  }
+
+  function resumeSpeaking() {
+    if (!S.pendingSpeech || !S.pendingSpeech.length) return false;
+    setState("speaking");
+    S.isSpeaking = true;
+    setTranscript("Resuming\u2026");
+    speakNext();
+    return true;
+  }
+
+  function ask(question) {
+    setState("processing"); openPanel();
+    setTranscript("\u201C" + question + "\u201D");
+    setAnswer("Thinking\u2026 (first LLM query can take up to a minute while the model warms up)");
+    // Abort any in-flight request first.
+    try { if (S.abortCtl) S.abortCtl.abort(); } catch(e) {}
+    S.abortCtl = (typeof AbortController !== "undefined") ? new AbortController() : null;
+    var timeoutId = setTimeout(function(){
+      try { if (S.abortCtl) S.abortCtl.abort(); } catch(e) {}
+    }, 120000);
+
+    var page = root.dataset.page || S.pageKey || PAGE_KEY;
+    fetch(S.apiUrl + "/companion/ask", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question: question, page: page }),
+      signal: S.abortCtl ? S.abortCtl.signal : undefined
+    })
+    .then(function(r){
+      if (!r.ok) return r.text().then(function(t){ return Promise.reject("HTTP " + r.status + (t ? ": " + t.slice(0,120) : "")); });
+      return r.json();
+    })
+    .then(function(d){
+      clearTimeout(timeoutId);
+      var ans = (d && d.answer) || "I couldn't find an answer for that.";
+      setAnswer(ans);
+      speak(ans);
+    })
+    .catch(function(err){
+      clearTimeout(timeoutId);
+      setState("idle");
+      var msg = (err && err.name === "AbortError") ? "Request timed out." :
+                (typeof err === "string") ? err :
+                (err && err.message) ? err.message : String(err);
+      setAnswer("Couldn't reach the backend \u2014 " + msg + " (tried " + S.apiUrl + ")");
+      setTimeout(startWake, 1500);
+    });
+  }
+
+  function startAsk() {
+    if (S.isListening) return;
+    // If we're speaking, cancel it and drop pending sentences so the mic can
+    // pick up a new question clearly.
+    if (S.isSpeaking || (S.pendingSpeech && S.pendingSpeech.length)) stopSpeaking(false);
+    stopWake();
+    openPanel();
+    setTranscript("Listening\u2026");
+    setState("listening");
+    try {
+      S.askRec = new SR();
+    } catch(e) {
+      setState("idle"); setAnswer("Speech recognition unavailable."); return;
+    }
+    var rec = S.askRec;
+    rec.lang = "en-US"; rec.continuous = false;
+    rec.interimResults = true; rec.maxAlternatives = 1;
+    var finalText = "";
+    rec.onstart = function(){ S.isListening = true; };
+    rec.onresult = function(e){
+      var interim = ""; finalText = "";
+      for (var i=e.resultIndex; i<e.results.length; i++) {
+        var t = e.results[i][0].transcript;
+        if (e.results[i].isFinal) finalText += t; else interim += t;
+      }
+      setTranscript(finalText || interim || "\u2026");
+    };
+    rec.onerror = function(){ S.isListening = false; setState("idle"); setTimeout(startWake, 1000); };
+    rec.onend = function(){
+      S.isListening = false;
+      if (finalText.trim()) ask(finalText.trim());
+      else { setState("idle"); setTimeout(startWake, 800); }
+    };
+    try { rec.start(); }
+    catch(e) { S.isListening = false; setState("idle"); setTimeout(startWake, 1200); }
+  }
+
+  function stopAsk() {
+    if (S.askRec) { try { S.askRec.stop(); } catch(e) {} }
+    try { if (S.abortCtl) S.abortCtl.abort(); } catch(e) {}
+    stopSpeaking(false);
+    S.isListening = false;
+    setState("idle");
+    setTimeout(startWake, 400);
+  }
+
+  // Wake recognizer runs continuously — it catches the wake word when idle AND
+  // catches voice commands ("stop", "continue") + new questions while speaking.
+  // Only paused when askRec is actively capturing a question, to avoid mic conflict.
+  function startWake() {
+    if (!SR || S.wakeActive || S.isListening) return;
+    try {
+      S.wakeRec = new SR();
+    } catch(e) { S.wakeActive = false; return; }
+    var rec = S.wakeRec;
+    rec.lang = "en-US"; rec.continuous = true;
+    rec.interimResults = true; rec.maxAlternatives = 3;
+    rec.onstart = function(){ S.wakeActive = true; };
+
+    rec.onresult = function(e){
+      for (var i=e.resultIndex; i<e.results.length; i++) {
+        // Only act on finals during speech/paused (avoid triggering on half-heard echo).
+        var isFinal = e.results[i].isFinal;
+        for (var j=0; j<e.results[i].length; j++) {
+          var raw = (e.results[i][j].transcript || "").trim();
+          if (!raw) continue;
+          var t = raw.toLowerCase();
+
+          // 1. Wake word — always wins, starts a new question capture.
+          if (isWake(t)) {
+            try { rec.stop(); } catch(err) {}
+            S.wakeActive = false;
+            setTimeout(startAsk, 150);
+            return;
+          }
+
+          // 2. Interrupt while speaking.
+          if (S.isSpeaking) {
+            if (!isFinal) continue;
+            if (isEcho(t)) continue;
+            if (isStopCmd(t)) {
+              stopSpeaking(true); // keep pending, user may say "continue"
+              return;
+            }
+            if (looksLikeQuestion(t)) {
+              // New question mid-speech → drop pending, answer new one.
+              try { rec.stop(); } catch(err) {}
+              S.wakeActive = false;
+              stopSpeaking(false);
+              setTimeout(function(){ ask(raw); }, 100);
+              return;
+            }
+            continue; // ignore short ambient speech
+          }
+
+          // 3. Paused (stopped mid-answer with pending chunks left).
+          if (!S.isSpeaking && S.pendingSpeech && S.pendingSpeech.length) {
+            if (!isFinal) continue;
+            if (isResumeCmd(t)) {
+              resumeSpeaking();
+              return;
+            }
+            if (looksLikeQuestion(t)) {
+              try { rec.stop(); } catch(err) {}
+              S.wakeActive = false;
+              S.pendingSpeech = [];
+              setTimeout(function(){ ask(raw); }, 100);
+              return;
+            }
+          }
+        }
+      }
+    };
+
+    rec.onerror = function(){ S.wakeActive = false; setTimeout(startWake, 2500); };
+    rec.onend   = function(){
+      S.wakeActive = false;
+      // Always restart unless the user is actively dictating a question.
+      if (!S.isListening) setTimeout(startWake, 1200);
+    };
+    try { rec.start(); } catch(e) { S.wakeActive = false; setTimeout(startWake, 2500); }
+  }
+
+  function stopWake() {
+    if (S.wakeRec) { try { S.wakeRec.stop(); } catch(e) {} }
+    S.wakeActive = false;
+  }
+
+  // ── Rebind: clone + replace each interactive element so stale closures
+  // from a destroyed iframe are stripped, then attach the fresh handlers
+  // that close over THIS mount's up-to-date S namespace.
+  function rebindButtons() {
+    function swap(id) {
+      var el = $id(id);
+      if (!el) return null;
+      var clone = el.cloneNode(true);
+      el.parentNode.replaceChild(clone, el);
+      return clone;
+    }
+    var btn      = swap("qb-companion-btn");
+    var closeBtn = swap("qb-companion-close");
+    var micBtn   = swap("qb-companion-mic");
+    var stopBtn  = swap("qb-companion-stop");
+
+    if (btn) {
+      btn.addEventListener("click", function(ev){ ev.stopPropagation(); togglePanel(); });
+      btn.addEventListener("keydown", function(ev){
+        if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); togglePanel(); }
+      });
+    }
+    if (closeBtn) closeBtn.addEventListener("click", function(ev){ ev.stopPropagation(); closePanel(); });
+    if (micBtn)   micBtn.addEventListener("click",   function(ev){ ev.stopPropagation(); startAsk(); });
+    if (stopBtn)  stopBtn.addEventListener("click",  function(ev){ ev.stopPropagation(); stopAsk(); });
+  }
+
+  rebindButtons();
+
+  // Escape-key handler: install once, but always call the *current* closePanel.
+  if (!S.escInstalled) {
+    S.escInstalled = true;
+    pdoc.addEventListener("keydown", function(ev){
+      if (ev.key === "Escape") {
+        var r = pdoc.getElementById("qb-companion");
+        if (r && r.classList.contains("open")) r.classList.remove("open");
+      }
+    });
+  }
+
+  // Kick off wake-word listening only the first time; subsequent mounts keep
+  // the existing recognizer alive. If it died (state desynced), restart.
+  if (!S.wakeBootstrapped) {
+    S.wakeBootstrapped = true;
+    setTimeout(startWake, 1500);
+  } else if (!S.wakeActive && !S.isListening && !S.isSpeaking) {
+    setTimeout(startWake, 600);
+  }
+
+  console.log("[QoSBuddy Companion] mounted on:", PAGE_NAME, "\u2022 api:", S.apiUrl);
+})();
+</script>
+</body></html>
+"""
+
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -795,6 +1423,66 @@ def page_anomaly_feed(anomaly_df):
     </div>""", unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
+    # ── SHAP global feature importance (M1 explainability) ────────────────────
+    st.markdown('<div class="glass-panel"><div class="glass-panel-title">🧠 SHAP Feature Importance — Why the models flag anomalies</div>', unsafe_allow_html=True)
+    shap_resp, shap_err = _rl_api_get("/explain/shap?limit=15", timeout=6.0)
+    if shap_err or not shap_resp or "data" not in shap_resp:
+        st.info(f"SHAP importance unavailable: {shap_err or 'no data'}")
+    else:
+        s_rows = shap_resp.get("data", [])
+        if not s_rows:
+            st.info("SHAP rows empty.")
+        else:
+            sdf = pd.DataFrame(s_rows)
+            feat_col = "feature" if "feature" in sdf.columns else sdf.columns[0]
+            val_col  = "mean_abs_shap" if "mean_abs_shap" in sdf.columns else sdf.columns[1]
+            sdf = sdf.sort_values(val_col, ascending=True).tail(15)
+            fig = go.Figure(go.Bar(
+                x=sdf[val_col], y=sdf[feat_col], orientation="h",
+                marker=dict(color=COLORS["cyan"]),
+                hovertemplate="<b>%{y}</b><br>|SHAP|=%{x:.4f}<extra></extra>",
+            ))
+            _sh_xaxis = {**PLOT_LAYOUT.get("xaxis", {}), "title": "mean |SHAP|"}
+            fig.update_layout(**{k: v for k, v in PLOT_LAYOUT.items() if k != "xaxis"},
+                              height=420, margin=dict(t=10,b=10,l=10,r=10),
+                              xaxis=_sh_xaxis)
+            st.plotly_chart(fig, use_container_width=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # ── Live anomaly scorer (M1 supervised ensemble) ──────────────────────────
+    st.markdown('<div class="glass-panel"><div class="glass-panel-title">🔬 Live Anomaly Scorer — Ensemble (IF + XGBoost + RF + GBT)</div>', unsafe_allow_html=True)
+    st.caption("Enter a KPI window and score it against all loaded v2 supervised models.")
+    with st.form("_anom_score_form", clear_on_submit=False):
+        c1, c2, c3, c4 = st.columns(4)
+        sinr   = c1.number_input("SINR DL (dB)",    value=10.0,  step=0.5, format="%.2f")
+        thr    = c2.number_input("Throughput (Mbps)", value=2.5, step=0.1, format="%.2f")
+        delay  = c3.number_input("Delay (ms)",       value=50.0, step=1.0, format="%.2f")
+        jit    = c4.number_input("Jitter (ms)",      value=5.0,  step=0.5, format="%.2f")
+        c5, c6, c7, c8 = st.columns(4)
+        ploss  = c5.number_input("Packet Loss",      value=0.02, step=0.01, format="%.3f")
+        prb    = c6.number_input("PRB Util",         value=0.50, step=0.05, format="%.2f")
+        retx   = c7.number_input("Retransmissions",  value=3.0,  step=1.0,  format="%.1f")
+        lvl    = c8.selectbox("Load Level", [0,1,2,3,4], index=2)
+        submitted = st.form_submit_button("Score window", use_container_width=True)
+    if submitted:
+        payload = {
+            "sinr_dl_db": sinr, "throughput_mbps": thr, "delay_ms": delay, "jitter_ms": jit,
+            "packet_loss_ratio": ploss, "prb_utilization": prb, "retransmissions": retx,
+            "load_level": int(lvl),
+        }
+        resp, err = _rl_api_post("/anomaly/score", payload, timeout=10.0)
+        if err or not resp:
+            st.error(f"Scoring failed: {err}")
+        else:
+            ens = resp.get("ensemble_flag", 0)
+            flagged = resp.get("flagged_by", [])
+            badge = "🚨 ANOMALY" if ens else "✅ NORMAL"
+            colr = "#ff4d6d" if ens else "#00e5a0"
+            st.markdown(f"<div style='padding:10px;border-radius:8px;background:rgba(0,0,0,0.15);border:1px solid {colr};color:{colr};font-weight:700;'>Ensemble verdict: {badge} &nbsp;·&nbsp; flagged by {len(flagged)}/{len(resp.get('results',{}))} models</div>", unsafe_allow_html=True)
+            res_df = pd.DataFrame([{"model": k, **(v if isinstance(v, dict) else {"error": str(v)})} for k, v in resp.get("results", {}).items()])
+            st.dataframe(res_df, use_container_width=True, height=200)
+    st.markdown("</div>", unsafe_allow_html=True)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  PAGE 3 — CAUSAL ANALYSIS
@@ -950,6 +1638,38 @@ def page_causal_root_cause(causal_df, cf_df):
             fig.update_layout(**PLOT_LAYOUT, height=280, showlegend=False, margin=dict(t=10,b=10,l=10,r=10), yaxis_title="Anomaly Rate (%)")
             st.plotly_chart(fig, width='stretch')
             st.markdown("</div>", unsafe_allow_html=True)
+
+    # ── Live DoWhy Counterfactual (M3 Innovation 1) ───────────────────────────
+    st.markdown('<div class="glass-panel"><div class="glass-panel-title">🧪 Live Counterfactual Estimator — DoWhy Causal Model</div>', unsafe_allow_html=True)
+    st.caption("Ask: *if the treatment were different, what would the outcome be?* — uses the live DoWhy model when available, with CSV fallback.")
+    with st.form("_cf_form", clear_on_submit=False):
+        c1, c2, c3 = st.columns(3)
+        treat = c1.selectbox("Treatment",
+            ["load_level", "sinr_dl_db", "packet_loss_ratio", "prb_utilization"],
+            key="_cf_treat")
+        obs   = c2.number_input("Observed value", value=3.0, step=0.5, format="%.3f", key="_cf_obs")
+        cf    = c3.number_input("Counterfactual value", value=1.0, step=0.5, format="%.3f", key="_cf_cf")
+        go_btn = st.form_submit_button("Estimate effect", use_container_width=True)
+    if go_btn:
+        payload = {"treatment": treat, "treatment_val": obs, "counterfactual": cf}
+        resp, err = _rl_api_post("/causal/counterfactual", payload, timeout=15.0)
+        if err or not resp:
+            st.error(f"Counterfactual estimate failed: {err}")
+        else:
+            src = resp.get("source", "?")
+            effect = resp.get("estimated_effect")
+            c1, c2, c3 = st.columns(3)
+            with c1: kpi_card("SOURCE",    src,                    "",  "ok", 100)
+            with c2: kpi_card("OBSERVED",  f"{resp.get('observed', obs):.3f}", "",  "warn", 60)
+            with c3: kpi_card("CF VALUE",  f"{resp.get('counterfactual', cf):.3f}", "",  "ok", 60)
+            if effect is not None:
+                st.success(f"Estimated causal effect: **{effect}**")
+            elif "avg_reduction_pct" in resp:
+                st.info(f"CSV fallback — average reduction after mitigation: **{resp['avg_reduction_pct']}%**")
+            note = resp.get("note")
+            if note:
+                st.caption(note)
+    st.markdown("</div>", unsafe_allow_html=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1249,62 +1969,147 @@ def page_benchmarking(bench_df):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  PAGE — QoS FORECAST (DSO1.1 — M2: XGBoost + Prophet)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def page_qos_forecast():
+    page_header("🔮","QoS Forecast","DSO1.1 · XGBoost regression + Prophet confidence intervals (M2)")
+
+    st.markdown('<div class="glass-panel"><div class="glass-panel-title">Jitter Forecast — XGBoost Predictions vs Actual</div>', unsafe_allow_html=True)
+
+    pred, pred_err = _rl_api_get("/qos/predictions?limit=2000", timeout=8.0)
+    if pred_err or not pred or "data" not in pred:
+        st.warning(f"Predictions unavailable: {pred_err or 'no data'}")
+        st.markdown("</div>", unsafe_allow_html=True)
+    else:
+        rows = pred.get("data", [])
+        if not rows:
+            st.info("No prediction rows loaded.")
+        else:
+            pdf = pd.DataFrame(rows)
+            if "y_true" in pdf.columns and "y_pred" in pdf.columns:
+                mae  = float((pdf["y_true"] - pdf["y_pred"]).abs().mean())
+                rmse = float(((pdf["y_true"] - pdf["y_pred"])**2).mean() ** 0.5)
+                denom = pdf["y_true"].replace(0, np.nan).abs()
+                mape  = float(((pdf["y_true"] - pdf["y_pred"]).abs() / denom).mean() * 100)
+
+                c1, c2, c3, c4 = st.columns(4)
+                with c1: kpi_card("ROWS",  f"{len(pdf):,}", "",    "ok", 100)
+                with c2: kpi_card("MAE",   f"{mae:.3f}",    "ms",  "ok" if mae < 2 else "warn", min(mae*20,100))
+                with c3: kpi_card("RMSE",  f"{rmse:.3f}",   "ms",  "ok" if rmse < 3 else "warn", min(rmse*15,100))
+                with c4: kpi_card("MAPE",  f"{mape:.1f}",   "%",   "ok" if mape < 20 else "warn", min(mape, 100))
+
+                sample = pdf.head(300).reset_index(drop=True)
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(y=sample["y_true"], mode="lines", name="Actual",
+                                         line=dict(color=COLORS["cyan"], width=1.8)))
+                fig.add_trace(go.Scatter(y=sample["y_pred"], mode="lines", name="Predicted",
+                                         line=dict(color=COLORS["amber"], width=1.8, dash="dot")))
+                fig.update_layout(**PLOT_LAYOUT, height=320, margin=dict(t=20,b=10,l=10,r=10),
+                                  legend=dict(orientation="h", y=1.08))
+                st.plotly_chart(fig, use_container_width=True)
+
+                fig2 = go.Figure()
+                fig2.add_trace(go.Scatter(x=pdf["y_true"], y=pdf["y_pred"], mode="markers",
+                                          marker=dict(size=4, color=COLORS["cyan"], opacity=0.5),
+                                          name="Pred vs Actual"))
+                lo = float(pdf[["y_true","y_pred"]].min().min())
+                hi = float(pdf[["y_true","y_pred"]].max().max())
+                fig2.add_trace(go.Scatter(x=[lo,hi], y=[lo,hi], mode="lines",
+                                          line=dict(color=COLORS["emerald"], dash="dash"),
+                                          name="y = x"))
+                fig2.update_layout(**PLOT_LAYOUT, height=280, margin=dict(t=20,b=10,l=10,r=10),
+                                   legend=dict(orientation="h", y=1.1))
+                st.plotly_chart(fig2, use_container_width=True)
+            else:
+                st.info("predicted_jitter.csv missing y_true/y_pred columns.")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown('<div class="glass-panel"><div class="glass-panel-title">Prophet Forecast — Per-UE / Metric with Confidence Interval</div>', unsafe_allow_html=True)
+
+    fc, fc_err = _rl_api_get("/qos/forecast", timeout=8.0)
+    if fc_err or not fc or "data" not in fc:
+        st.warning(f"Forecast unavailable: {fc_err or 'no data'}")
+    else:
+        fc_rows = fc.get("data", [])
+        if not fc_rows:
+            st.info("forecast_ci.csv is empty.")
+        else:
+            fdf = pd.DataFrame(fc_rows)
+            ue_opts = sorted(fdf["ue_id"].dropna().unique().tolist()) if "ue_id" in fdf.columns else []
+            met_opts = sorted(fdf["metric"].dropna().unique().tolist()) if "metric" in fdf.columns else []
+            c1, c2 = st.columns(2)
+            ue_sel  = c1.selectbox("UE",     ue_opts  or ["—"], key="_fc_ue")
+            met_sel = c2.selectbox("Metric", met_opts or ["—"], key="_fc_met")
+
+            sub = fdf
+            if "ue_id" in fdf.columns and ue_opts:
+                sub = sub[sub["ue_id"] == ue_sel]
+            if "metric" in fdf.columns and met_opts:
+                sub = sub[sub["metric"] == met_sel]
+            if "ds" in sub.columns:
+                sub = sub.sort_values("ds")
+
+            if len(sub) == 0:
+                st.info("No forecast rows match the current filter.")
+            else:
+                fig = go.Figure()
+                x = sub["ds"] if "ds" in sub.columns else list(range(len(sub)))
+                if "yhat_upper" in sub.columns and "yhat_lower" in sub.columns:
+                    fig.add_trace(go.Scatter(x=x, y=sub["yhat_upper"], mode="lines",
+                                             line=dict(color="rgba(0,212,255,0)"),
+                                             showlegend=False))
+                    fig.add_trace(go.Scatter(x=x, y=sub["yhat_lower"], mode="lines",
+                                             fill="tonexty",
+                                             fillcolor=hex_to_rgba(COLORS["cyan"], 0.15),
+                                             line=dict(color="rgba(0,212,255,0)"),
+                                             name="95% CI"))
+                if "yhat" in sub.columns:
+                    fig.add_trace(go.Scatter(x=x, y=sub["yhat"], mode="lines",
+                                             line=dict(color=COLORS["cyan"], width=2.2),
+                                             name="yhat"))
+                fig.update_layout(**PLOT_LAYOUT, height=360, margin=dict(t=20,b=10,l=10,r=10),
+                                  legend=dict(orientation="h", y=1.08))
+                st.plotly_chart(fig, use_container_width=True)
+
+                st.dataframe(sub.head(200).reset_index(drop=True),
+                             use_container_width=True, height=280)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  PAGE 4 — RL ACTIONS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def page_rl_actions(anomaly_df, causal_df):
     page_header("🤖","RL Agent Actions","DSO3.1 · PPO Policy · Digital Twin Environment (NS-3)")
-    # Find common merge key — timestamp for v1, window_idx for v2
-    merge_cols = ["root_cause", "recommended_action"]
-    if "timestamp" in causal_df.columns and "timestamp" in anomaly_df.columns:
-        merge_key = "timestamp"
-    elif "window_idx" in causal_df.columns and "window_idx" in anomaly_df.columns:
-        merge_key = "window_idx"
+
+    # anomaly_df (v1, ns3.xls) and causal_df (v2, root_cause_labels.csv) have no
+    # shared join key — so compute action stats directly from causal_df where
+    # `recommended_action` actually lives. Restrict to anomalous windows when
+    # `true_label` is present.
+    if "recommended_action" in causal_df.columns:
+        src = causal_df
+        if "true_label" in src.columns and (src["true_label"] == 1).any():
+            src = src[src["true_label"] == 1]
+        action_stats = (
+            src.groupby("recommended_action")
+               .size()
+               .reset_index(name="events")
+               .sort_values("events", ascending=False)
+        )
     else:
-        merge_key = None
+        action_stats = pd.DataFrame({"recommended_action": [], "events": []})
 
-    if merge_key:
-        causal_sub = [merge_key] + [c for c in merge_cols if c in causal_df.columns]
-        merged = anomaly_df.merge(causal_df[causal_sub].drop_duplicates(subset=[merge_key]),
-                                  on=merge_key, how="left")
-    else:
-        merged = anomaly_df.copy()
-        for c in merge_cols:
-            if c in causal_df.columns and len(causal_df) == len(anomaly_df):
-                merged[c] = causal_df[c].values
-            elif c not in merged.columns:
-                merged[c] = "unknown"
-
-    for c in ["if_anomaly","if_score","packet_loss_ratio","severity","recommended_action"]:
-        if c not in merged.columns:
-            merged[c] = 0 if c in ("if_anomaly","if_score","packet_loss_ratio") else "unknown"
-
-    anomaly_rows = merged[merged["if_anomaly"]==1] if (merged["if_anomaly"]==1).any() else merged
-    action_stats = anomaly_rows.groupby("recommended_action").agg(
-        events=("recommended_action","count"),
-        avg_score=(merged.columns[merged.columns.isin(["if_score","IF_score"])][0] if merged.columns.isin(["if_score","IF_score"]).any() else merged.columns[1],"mean"),
-        avg_loss=("packet_loss_ratio","mean") if "packet_loss_ratio" in merged.columns else ("recommended_action","count"),
-        critical_pct=("severity", lambda x: (x=="critical").mean()) if "severity" in merged.columns else ("recommended_action", lambda x: 0.0),
-    ).reset_index().sort_values("events", ascending=False)
-
-    action_colors = [COLORS["cyan"],COLORS["emerald"],COLORS["amber"],COLORS["violet"]]
-    action_icons  = ["⚖️","🔧","&#128225;","🛠️"]
-
-    st.markdown('<div style="display:flex;gap:16px;margin-bottom:20px;flex-wrap:wrap;">', unsafe_allow_html=True)
-    for i, (_, row) in enumerate(action_stats.iterrows()):
-        c = action_colors[i % len(action_colors)]
-        ic = action_icons[i % len(action_icons)]
-        st.markdown(f"""
-        <div style="flex:1;min-width:200px;background:var(--glass);border:1px solid {c}33;
-                    border-radius:var(--r-lg);padding:20px;backdrop-filter:blur(16px);">
-          <div style="font-size:24px;margin-bottom:8px;">{ic}</div>
-          <div style="font-family:'IBM Plex Mono';font-size:9px;color:{c};text-transform:uppercase;letter-spacing:0.1em;margin-bottom:8px;">{row['recommended_action']}</div>
-          <div style="display:flex;gap:16px;flex-wrap:wrap;margin-top:12px;">
-            <div><div style="font-family:'IBM Plex Mono';font-size:9px;color:var(--text-3);">DISPATCHED</div><div style="font-family:'Syne';font-size:26px;font-weight:800;color:{c};">{int(row['events']):,}</div></div>
-            <div><div style="font-family:'IBM Plex Mono';font-size:9px;color:var(--text-3);">CRIT RATE</div><div style="font-family:'Syne';font-size:26px;font-weight:800;color:var(--rose);">{row['critical_pct']*100:.0f}%</div></div>
-          </div>
-        </div>""", unsafe_allow_html=True)
-    st.markdown("</div>", unsafe_allow_html=True)
+    # Historical action-dispatch summary (kept as a compact strip — the Live Agent
+    # Advisor below supersedes the per-action detail cards).
+    _n_actions  = int(len(action_stats))
+    _top_action = action_stats.iloc[0]["recommended_action"] if _n_actions else "—"
+    _top_events = int(action_stats.iloc[0]["events"]) if _n_actions else 0
+    c1, c2, c3 = st.columns(3)
+    with c1: kpi_card("ACTION CATEGORIES", f"{_n_actions}", "", "ok", 100)
+    with c2: kpi_card("TOP ACTION",         _top_action,      "", "ok", 100)
+    with c3: kpi_card("DISPATCHED",         f"{_top_events:,}", "", "ok", 100)
 
     col_l, col_r = st.columns(2)
     with col_l:
@@ -1344,9 +2149,10 @@ def page_rl_actions(anomaly_df, causal_df):
 
     with col_r:
         st.markdown('<div class="glass-panel"><div class="glass-panel-title">Action Distribution — Anomalous Events</div>', unsafe_allow_html=True)
+        _action_colors = [COLORS["cyan"], COLORS["emerald"], COLORS["amber"], COLORS["violet"]]
         fig = go.Figure(go.Pie(
             labels=action_stats["recommended_action"], values=action_stats["events"], hole=0.6,
-            marker=dict(colors=[hex_to_rgba(c,0.8) for c in action_colors[:len(action_stats)]],
+            marker=dict(colors=[hex_to_rgba(c,0.8) for c in _action_colors[:len(action_stats)]],
                         line=dict(color="#080c12",width=3)),
             textinfo="none",
             hovertemplate="<b>%{label}</b><br>%{value:,} events<extra></extra>",
@@ -1356,6 +2162,175 @@ def page_rl_actions(anomaly_df, causal_df):
                           margin=dict(t=10,b=60,l=10,r=10))
         st.plotly_chart(fig, width='stretch')
         st.markdown("</div>", unsafe_allow_html=True)
+
+    # ── Live PPO Inference (DSO3.1) ──────────────────────────────────────────
+    st.markdown("---")
+    st.markdown(
+        '<div style="font-family:\'Syne\';font-size:18px;font-weight:700;color:var(--text-1);'
+        'margin:18px 0 12px;">⚡ Live PPO Agent · Digital Twin Inference</div>',
+        unsafe_allow_html=True,
+    )
+
+    health, health_err = _rl_api_get("/health", timeout=3.0)
+    rl_ready = bool(health and health.get("rl_ready"))
+    if not rl_ready:
+        st.info(
+            f"🛰️ Live PPO inference is offline. "
+            f"Check that the API is running and that `stable-baselines3` + `torch` are installed. "
+            f"({health_err or (health and 'rl_ready=false')})"
+        )
+        return
+
+    # ── Panel: Live Advisor (single-UE recommendation) ──
+    adv_l, adv_r = st.columns([1, 1])
+    with adv_l:
+        st.markdown('<div class="glass-panel"><div class="glass-panel-title">🎯 Live Agent Advisor</div>', unsafe_allow_html=True)
+
+        # anomaly_df carries the raw KPI columns the PPO advisor needs.
+        # Prefer anomalous rows when the flag exists, else the full frame.
+        if "if_anomaly" in anomaly_df.columns and (anomaly_df["if_anomaly"] == 1).any():
+            obs_src = anomaly_df[anomaly_df["if_anomaly"] == 1]
+        else:
+            obs_src = anomaly_df
+        needed = ["sinr_dl_db","throughput_mbps","delay_ms","jitter_ms",
+                  "packet_loss_ratio","prb_utilization","retransmissions"]
+        have = all(c in obs_src.columns for c in needed)
+
+        if not have:
+            st.caption("Anomaly table is missing raw KPI columns — advisor needs v1-format data.")
+        else:
+            ue_options = sorted(obs_src["ue_id"].dropna().unique().tolist()) if "ue_id" in obs_src.columns else []
+            if ue_options:
+                sel_ue = st.selectbox("UE to advise", ue_options, key="rl_adv_ue")
+                ue_rows = obs_src[obs_src["ue_id"] == sel_ue]
+                row = ue_rows.iloc[ue_rows["if_score"].argmax()] if "if_score" in ue_rows.columns else ue_rows.iloc[0]
+            else:
+                row = obs_src.iloc[0]
+
+            payload = {
+                "sinr_dl_db":        float(row["sinr_dl_db"]),
+                "throughput_mbps":   float(row["throughput_mbps"]),
+                "delay_ms":          float(row["delay_ms"]),
+                "jitter_ms":         float(row["jitter_ms"]),
+                "packet_loss_ratio": float(row["packet_loss_ratio"]),
+                "prb_utilization":   float(row["prb_utilization"]),
+                "retransmissions":   float(row.get("retransmissions", 0)),
+                "sla_risk_score":    float(row.get("if_score", 0.0)) * 10.0,
+            }
+
+            if st.button("Get recommendation", key="rl_adv_btn", type="primary"):
+                with st.spinner("Querying PPO policy…"):
+                    resp, err = _rl_api_post("/rl/predict", payload, timeout=10.0)
+                if err:
+                    st.error(f"Inference failed: {err}")
+                else:
+                    probs = resp.get("probabilities", {})
+                    action = resp.get("action_name", "?")
+                    icon_map = {"reroute":"⚖️","throttle":"🔧","prioritize":"&#128225;","no_action":"🛠️"}
+                    st.markdown(
+                        f'<div style="font-family:\'IBM Plex Mono\';font-size:10px;color:var(--text-3);'
+                        f'text-transform:uppercase;letter-spacing:0.12em;">PPO Recommendation</div>'
+                        f'<div style="font-family:\'Syne\';font-size:32px;font-weight:800;color:{COLORS["emerald"]};'
+                        f'margin:4px 0 14px;">{icon_map.get(action,"🤖")} {action.replace("_"," ").upper()}</div>',
+                        unsafe_allow_html=True,
+                    )
+                    if probs:
+                        pdf = pd.DataFrame(
+                            sorted(probs.items(), key=lambda kv: -kv[1]),
+                            columns=["action", "probability"],
+                        )
+                        bar = go.Figure(go.Bar(
+                            x=pdf["probability"], y=pdf["action"], orientation="h",
+                            marker=dict(color=[hex_to_rgba(COLORS["emerald"], 0.85 if a == action else 0.35)
+                                               for a in pdf["action"]]),
+                            text=[f"{p:.1%}" for p in pdf["probability"]], textposition="outside",
+                        ))
+                        _bar_xaxis = {**PLOT_LAYOUT.get("xaxis", {}), "range": [0, 1], "tickformat": ".0%"}
+                        bar.update_layout(**{k: v for k, v in PLOT_LAYOUT.items() if k != "xaxis"},
+                                          height=200, margin=dict(t=5,b=5,l=5,r=40),
+                                          xaxis=_bar_xaxis)
+                        st.plotly_chart(bar, width='stretch')
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    with adv_r:
+        st.markdown('<div class="glass-panel"><div class="glass-panel-title">🏁 Training Benchmark · PPO vs Baselines</div>', unsafe_allow_html=True)
+        bench, berr = _rl_api_get("/rl/benchmark", timeout=5.0)
+        if berr or not bench:
+            st.caption(f"Benchmark unavailable: {berr or 'empty response'}")
+        else:
+            rows = bench.get("benchmark", {})
+            if rows:
+                bdf = (
+                    pd.DataFrame(rows).T.reset_index().rename(columns={"index": "policy"})
+                )
+                keep = [c for c in ["policy","reward_mean","violations_mean","violation_rate","risk_mean"] if c in bdf.columns]
+                bdf = bdf[keep]
+                color_for = {"PPO (best)": COLORS["emerald"], "Random": COLORS["cyan"], "Rule-Based": "#4a5568"}
+                colors_bar = [color_for.get(p, COLORS["violet"]) for p in bdf["policy"]]
+
+                fig_b = go.Figure(go.Bar(
+                    x=bdf["policy"], y=bdf["reward_mean"],
+                    marker=dict(color=[hex_to_rgba(c, 0.8) for c in colors_bar],
+                                line=dict(color=colors_bar, width=2)),
+                    text=[f"{v:.2f}" for v in bdf["reward_mean"]], textposition="outside",
+                ))
+                fig_b.update_layout(**PLOT_LAYOUT, height=220, margin=dict(t=10,b=10,l=10,r=10),
+                                    yaxis_title="Mean reward")
+                st.plotly_chart(fig_b, width='stretch')
+                st.caption(
+                    f"Model: `{bench.get('algorithm','PPO')}` · "
+                    f"Env: `{bench.get('environment','QoSNetworkEnv')}` · "
+                    f"Trained on {bench.get('total_timesteps','?'):,} timesteps" if isinstance(bench.get('total_timesteps'), int)
+                    else f"Model: `{bench.get('algorithm','PPO')}` · Env: `{bench.get('environment','QoSNetworkEnv')}`"
+                )
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    # ── Panel: Live Simulation on Digital Twin ──
+    st.markdown('<div class="glass-panel"><div class="glass-panel-title">🎮 Live Digital-Twin Simulation</div>', unsafe_allow_html=True)
+    sim_l, sim_r = st.columns([1, 3])
+    with sim_l:
+        n_ep = st.slider("Episodes", 1, 50, 10, key="rl_sim_episodes")
+        sim_go = st.button("Run PPO on Twin", key="rl_sim_btn", type="primary")
+    with sim_r:
+        if sim_go:
+            with st.spinner(f"Running {n_ep} episodes on the NS-3 digital twin…"):
+                sim, serr = _rl_api_post("/rl/simulate", {"episodes": n_ep, "deterministic": True}, timeout=120.0)
+            if serr:
+                st.error(f"Simulation failed: {serr}")
+            elif sim:
+                st.session_state["_rl_sim_result"] = sim
+
+        sim = st.session_state.get("_rl_sim_result")
+        if sim:
+            eps_df = pd.DataFrame(sim["episodes"])
+            summ = sim["summary"]
+
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Mean reward", f"{summ['mean_reward']:.2f}", f"±{summ['std_reward']:.2f}")
+            k2.metric("Violations / ep", f"{summ['mean_violations']:.1f}")
+            k3.metric("Total violations", f"{summ['total_violations']}")
+            top_act = max(summ["action_mix"].items(), key=lambda kv: kv[1])
+            k4.metric("Dominant action", top_act[0], f"{top_act[1]:.0%}")
+
+            fig_s = make_subplots(specs=[[{"secondary_y": True}]])
+            fig_s.add_trace(go.Scatter(
+                x=eps_df["episode"], y=eps_df["reward"], name="Reward",
+                mode="lines+markers", line=dict(color=COLORS["emerald"], width=2.5),
+                fill="tozeroy", fillcolor=hex_to_rgba(COLORS["emerald"], 0.1),
+            ), secondary_y=False)
+            fig_s.add_trace(go.Bar(
+                x=eps_df["episode"], y=eps_df["violations"], name="SLA violations",
+                marker=dict(color=hex_to_rgba(COLORS["amber"], 0.7)),
+            ), secondary_y=True)
+            fig_s.update_layout(**PLOT_LAYOUT, height=280, margin=dict(t=10,b=10,l=10,r=10),
+                                xaxis_title="Episode")
+            fig_s.update_yaxes(title_text="Reward",       secondary_y=False)
+            fig_s.update_yaxes(title_text="Violations",   secondary_y=True)
+            st.plotly_chart(fig_s, width='stretch')
+        else:
+            st.caption("Run a simulation to see per-episode reward and SLA-violation traces from the PPO agent.")
+    st.markdown("</div>", unsafe_allow_html=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -4040,10 +5015,26 @@ def _make_pdf(title, anomaly_df, causal_df, include_chat, include_raw):
     ]))
     story += [kt, Spacer(1,10)]
     story.append(Paragraph("Root Cause Analysis (DSO1.2)", h1_s))
-    rc_s = causal_df.groupby(["root_cause","recommended_action"]).agg(count=("if_anomaly","count"), avg=("packet_loss_ratio","mean")).reset_index()
+    # v1 and v2 causal_df have different columns — pick what's available.
+    _count_col = next((c for c in ("if_anomaly","true_label","root_cause") if c in causal_df.columns), "root_cause")
+    _loss_col  = next((c for c in ("packet_loss_ratio","avg_loss","risk_proba") if c in causal_df.columns), None)
+    _group_cols = [c for c in ("root_cause","recommended_action") if c in causal_df.columns]
+    if _group_cols:
+        agg_map = {"count": (_count_col, "count")}
+        if _loss_col:
+            agg_map["avg"] = (_loss_col, "mean")
+        rc_s = causal_df.groupby(_group_cols).agg(**agg_map).reset_index()
+    else:
+        rc_s = pd.DataFrame(columns=["root_cause","recommended_action","count","avg"])
     rd = [["Root Cause","Action","Events","Avg Loss"]]
     for _, r in rc_s.iterrows():
-        rd.append([r["root_cause"], r["recommended_action"], str(r["count"]), f"{r['avg']*100:.1f}%"])
+        avg_txt = f"{r['avg']*100:.1f}%" if "avg" in rc_s.columns and pd.notna(r.get("avg")) else "—"
+        rd.append([
+            r.get("root_cause","—"),
+            r.get("recommended_action","—"),
+            str(r["count"]),
+            avg_txt,
+        ])
     rt = Table(rd, colWidths=[3.5*cm,7*cm,2.5*cm,2.5*cm])
     rt.setStyle(TableStyle([
         ("BACKGROUND",(0,0),(-1,0),GREEN), ("TEXTCOLOR",(0,0),(-1,0),colors.white),
@@ -4095,10 +5086,16 @@ def main():
     elif page == "sla_risk":   page_sla_risk(sla_df)
     elif page == "severity":   page_severity_triage(severity_df)
     elif page == "benchmark":  page_benchmarking(bench_df)
+    elif page == "forecast":   page_qos_forecast()
     elif page == "rl":         page_rl_actions(anomaly_df, causal_df)
     elif page == "chat":       page_rag_chat()
     elif page == "voice":      page_voice_assistant()
     elif page == "export":     page_export_report(anomaly_df, causal_df)
+
+    # Floating companion is present on every page except the full Voice NOC
+    # page, which has its own large 3D avatar and would conflict.
+    if page != "voice":
+        render_companion(page)
 
 
 if __name__ == "__main__":

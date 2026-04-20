@@ -1,0 +1,46 @@
+{
+  "module": "M1 \u2014 RL Agent (DSO3.1)",
+  "algorithm": "PPO",
+  "library": "stable-baselines3",
+  "total_timesteps": 200000,
+  "n_envs": 4,
+  "episode_len": 200,
+  "policy": "MlpPolicy",
+  "net_arch": [
+    128,
+    128
+  ],
+  "learning_rate": 0.0003,
+  "gamma": 0.99,
+  "ent_coef": 0.01,
+  "environment": "QoSNetworkEnv v3",
+  "dataset": "lena_dataset_cleaned.csv",
+  "model_files": {
+    "best": "ppo_qos_agent_best.zip",
+    "final": "ppo_qos_agent_v1.zip"
+  },
+  "benchmark": {
+    "Random": {
+      "reward_mean": 5.3675,
+      "reward_std": 1.6345,
+      "violations_mean": 8.2,
+      "violation_rate": 4.1,
+      "risk_mean": 0.1106
+    },
+    "Rule-Based": {
+      "reward_mean": -1.1125,
+      "reward_std": 1.6989,
+      "violations_mean": 11.2,
+      "violation_rate": 5.6,
+      "risk_mean": 0.1637
+    },
+    "PPO (best)": {
+      "reward_mean": 9.04,
+      "reward_std": 1.3495,
+      "violations_mean": 3.95,
+      "violation_rate": 1.975,
+      "risk_mean": 0.0556
+    }
+  },
+  "handoff_to": "Module D \u2014 Dashboard / Self-Healing Controller"
+}

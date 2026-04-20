@@ -32,6 +32,18 @@ rank-bm25>=0.2.2               # Improvement #1: BM25 sparse retrieval
 scikit-learn>=1.4.0            # Improvement #5: IsolationForest for SHAP
 shap>=0.44.0                   # Improvement #5: SHAP explainability (XAI)
 
+# ── RL Agent (DSO3.1 — PPO policy on NS-3 digital twin) ───────────────────────
+stable-baselines3>=2.3.0
+gymnasium>=0.29.0
+torch>=2.2.0              # SB3 backend; CPU-only inference is sufficient
+
+# ── M1 anomaly ensemble + M2 forecasts + M3 causal (live inference) ──────────
+xgboost>=2.0.0            # M2 jitter/throughput + M1 supervised anomaly
+joblib>=1.3.0             # Loads M1 IF/RF/GBT pickle bundles
+dowhy>=0.12               # M3 live counterfactual estimator
+prophet>=1.1.5            # M2 forecast regeneration (offline)
+causal-learn>=0.1.4       # DoWhy dependency for graph discovery
+
 # ── PDF export ─────────────────────────────────────────────────────────────────
 reportlab>=4.2.0
 

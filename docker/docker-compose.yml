@@ -29,7 +29,7 @@ services:
       - QOSBUDDY_CHROMA_DIR=/app/chroma_store
       - OLLAMA_HOST=http://ollama:11434
     volumes:
-      - ./data:/app/data:ro
+      - ../data:/app/data:ro
       - chroma_store:/app/chroma_store
       - ../rag:/app/rag:ro
     depends_on:
@@ -46,10 +46,14 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - ./data:/app/data:ro
+      - ../data:/app/data:ro
       - chroma_store:/app/chroma_store
       - ../rag:/app/rag:ro
       - ../api:/app/api:ro
+      - ../rl_agent:/app/rl_agent:ro
+      - ../qos_forecast:/app/qos_forecast:ro
+      - ../causal_models:/app/causal_models:ro
+      - ../anomaly_models:/app/anomaly_models:ro
     environment:
       - QOSBUDDY_DATA_DIR=/app/data
       - QOSBUDDY_CHROMA_DIR=/app/chroma_store
@@ -74,7 +78,7 @@ services:
     ports:
       - "8501:8501"
     volumes:
-      - ./data:/app/data:ro
+      - ../data:/app/data:ro
       - chroma_store:/app/chroma_store
       - ../rag:/app/rag:ro
       - ../dashboard:/app/dashboard:ro

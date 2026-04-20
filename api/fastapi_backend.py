@@ -44,6 +44,12 @@ _sla_df        = None   # sla_breach_predictions.csv
 _severity_df   = None   # severity_triage.csv
 _bench_df      = None   # benchmark_report_by_category.csv
 _rl_df         = None   # rl_vs_baseline_comparison.csv
+_rl_policy     = None   # rl_agent.RLPolicy — PPO agent (DSO3.1)
+_jitter_pred_df = None  # predicted_jitter.csv (M2, DSO1.1)
+_forecast_ci_df = None  # forecast_ci.csv (M2, Prophet CI per UE/metric)
+_shap_df       = None   # shap_importance_ns3.xls (M1 SHAP explanations)
+_dowhy_model   = None   # dowhy_model.pkl (M3, live counterfactual)
+_anomaly_models = {}    # v2 supervised models (IF, XGB) loaded from anomaly_models/
 _data_version  = "v1"   # "v1" or "v2"
 
 DATA_DIR = Path(os.getenv("QOSBUDDY_DATA_DIR", "./data"))
@@ -69,7 +75,8 @@ async def lifespan(app: FastAPI):
     """Load all heavy resources on startup; release on shutdown."""
     global _collection, _embed_model, _chain
     global _anomaly_df, _anomaly_v2_df, _causal_df, _cf_df
-    global _sla_df, _severity_df, _bench_df, _rl_df, _data_version
+    global _sla_df, _severity_df, _bench_df, _rl_df, _rl_policy, _data_version
+    global _jitter_pred_df, _forecast_ci_df, _shap_df, _dowhy_model, _anomaly_models
 
     log.info("QoSBuddy M6 API v2 starting up…")
 
@@ -117,6 +124,23 @@ async def lifespan(app: FastAPI):
     _bench_df    = _safe_load_csv("benchmark_report_by_category.csv", "Benchmark report")
     _rl_df       = _safe_load_csv("rl_vs_baseline_comparison.csv", "RL comparison")
 
+    # ── M2 DSO1.1 — jitter/throughput forecasts ──
+    _jitter_pred_df = _safe_load_csv("predicted_jitter.csv", "M2 jitter predictions")
+    _forecast_ci_df = _safe_load_csv("forecast_ci.csv",     "M2 Prophet forecasts")
+
+    # ── M1 SHAP explanations (optional xls) ──
+    shap_path = DATA_DIR / "shap_importance_ns3.xls"
+    if shap_path.exists():
+        try:
+            _shap_df = pd.read_csv(shap_path)
+            log.info(f"SHAP importance: {len(_shap_df)} rows loaded")
+        except Exception as e:
+            try:
+                _shap_df = pd.read_excel(shap_path)
+                log.info(f"SHAP importance: {len(_shap_df)} rows loaded (excel)")
+            except Exception as e2:
+                log.warning(f"SHAP importance load failed: {e2}")
+
     # ── Load RAG stack ──
     try:
         from rag.rag_pipeline import (
@@ -128,6 +152,51 @@ async def lifespan(app: FastAPI):
         log.info(f"RAG stack ready — {_collection.count()} documents in KB")
     except Exception as e:
         log.warning(f"RAG stack not available: {e}")
+
+    # ── Load PPO RL agent (DSO3.1 — M1 handoff) ──
+    try:
+        from rl_agent import RLPolicy
+        _rl_policy = RLPolicy()
+        _rl_policy.load()
+        if _rl_policy.ready:
+            log.info("RL policy ready — PPO loaded on digital twin")
+        else:
+            log.warning(f"RL policy unavailable: {_rl_policy.error}")
+    except Exception as e:
+        log.warning(f"RL agent import failed: {e}")
+
+    # ── Load M3 DoWhy model for live counterfactuals ──
+    dowhy_path = Path(__file__).resolve().parent.parent / "causal_models" / "dowhy_model.pkl"
+    if dowhy_path.exists():
+        try:
+            import pickle
+            with open(dowhy_path, "rb") as f:
+                _dowhy_model = pickle.load(f)
+            log.info(f"DoWhy model loaded from {dowhy_path.name}")
+        except Exception as e:
+            log.warning(f"DoWhy model load failed: {e}")
+    else:
+        log.info("DoWhy model not present (causal_models/dowhy_model.pkl)")
+
+    # ── Load M1 v2 supervised anomaly models for live scoring ──
+    # Each pickle is a dict {model, features, threshold|best_cont}. We keep
+    # the bundle so /anomaly/score can pad inputs to each model's feature list.
+    models_dir = Path(__file__).resolve().parent.parent / "anomaly_models"
+    if models_dir.exists():
+        for name, rel in [
+            ("isolation_forest",  "isolation_forest_ns3.pkl"),
+            ("random_forest",     "random_forest_v2.pkl"),
+            ("gradient_boosting", "gradient_boosting_v2.pkl"),
+        ]:
+            fp = models_dir / rel
+            if not fp.exists():
+                continue
+            try:
+                import joblib
+                _anomaly_models[name] = joblib.load(fp)
+                log.info(f"Loaded anomaly model: {name}")
+            except Exception as e:
+                log.warning(f"Anomaly model {name} load failed: {e}")
 
     log.info(f"Startup complete. Data version: {_data_version}")
     yield
@@ -210,6 +279,42 @@ class RAGQueryResponse(BaseModel):
     mode:      str
 
 
+class CounterfactualRequest(BaseModel):
+    """Live DoWhy counterfactual — 'what would jitter be if X didn't happen?'"""
+    treatment:      str   = Field(..., description="name of the treatment variable")
+    treatment_val:  float = Field(..., description="observed treatment value")
+    counterfactual: float = Field(0.0,  description="counterfactual treatment value")
+
+
+class AnomalyScoreRequest(BaseModel):
+    """Score a single KPI window against the v2 supervised models."""
+    sinr_dl_db:        float
+    throughput_mbps:   float
+    delay_ms:          float
+    jitter_ms:         float
+    packet_loss_ratio: float
+    prb_utilization:   float
+    retransmissions:   float
+    load_level:        int = 2
+
+
+class RLObservation(BaseModel):
+    """8-dim observation for PPO inference. Order matches QoSNetworkEnv.OBS_COLS."""
+    sinr_dl_db:        float
+    throughput_mbps:   float
+    delay_ms:          float
+    jitter_ms:         float
+    packet_loss_ratio: float
+    prb_utilization:   float
+    retransmissions:   float
+    sla_risk_score:    float = 0.0
+
+
+class RLSimulateRequest(BaseModel):
+    episodes:      int  = Field(10, ge=1, le=100)
+    deterministic: bool = True
+
+
 class KPISummary(BaseModel):
     total_events:        int
     anomaly_rate_pct:    float
@@ -240,6 +345,7 @@ def health():
         "v2_loaded":    _anomaly_v2_df is not None,
         "v1_rows":      len(_anomaly_df) if _anomaly_df is not None else 0,
         "v2_rows":      len(_anomaly_v2_df) if _anomaly_v2_df is not None else 0,
+        "rl_ready":     bool(_rl_policy and _rl_policy.ready),
     }
 
 
@@ -613,6 +719,436 @@ def get_rl_summary():
         "episodes_evaluated": int(_rl_df["episode"].nunique()),
         "raw_data":           _rl_df.to_dict(orient="records"),
     }
+
+
+@app.post("/rl/predict")
+def rl_predict(obs: RLObservation, deterministic: bool = Query(True)):
+    """Live PPO inference — given current KPIs, return the recommended action
+    and the full action probability distribution."""
+    if not (_rl_policy and _rl_policy.ready):
+        raise HTTPException(503, f"RL policy not ready: {_rl_policy.error if _rl_policy else 'not initialised'}")
+    obs_list = [
+        obs.sinr_dl_db, obs.throughput_mbps, obs.delay_ms, obs.jitter_ms,
+        obs.packet_loss_ratio, obs.prb_utilization, obs.retransmissions, obs.sla_risk_score,
+    ]
+    try:
+        return _rl_policy.predict(obs_list, deterministic=deterministic)
+    except Exception as e:
+        raise HTTPException(500, f"Inference failed: {e}")
+
+
+@app.post("/rl/simulate")
+def rl_simulate(req: RLSimulateRequest):
+    """Run live episodes on the NS-3 digital twin using the trained PPO.
+    Returns per-episode rewards + SLA violations + action mix."""
+    if not (_rl_policy and _rl_policy.ready):
+        raise HTTPException(503, f"RL policy not ready: {_rl_policy.error if _rl_policy else 'not initialised'}")
+    try:
+        return _rl_policy.simulate(episodes=req.episodes, deterministic=req.deterministic)
+    except Exception as e:
+        raise HTTPException(500, f"Simulation failed: {e}")
+
+
+@app.get("/rl/benchmark")
+def rl_benchmark():
+    """Training-time benchmark (PPO vs Random vs Rule-Based) from rl_agent/config.json."""
+    if not (_rl_policy and _rl_policy.ready):
+        raise HTTPException(503, f"RL policy not ready: {_rl_policy.error if _rl_policy else 'not initialised'}")
+    return _rl_policy.benchmark()
+
+
+# ── M2 DSO1.1 — QoS Forecasts (Member 2) ──────────────────────────────────────
+
+@app.get("/qos/predictions")
+def qos_predictions(
+    ue_id:  Optional[int] = Query(None),
+    limit:  int = Query(500, le=5000),
+):
+    """Return XGBoost jitter predictions (y_true vs y_pred) from DSO1.1."""
+    if _jitter_pred_df is None:
+        raise HTTPException(503, "DSO1.1 predictions not loaded (predicted_jitter.csv)")
+    df = _jitter_pred_df.copy()
+    if ue_id is not None and "ue_id" in df.columns:
+        df = df[df["ue_id"] == ue_id]
+    df = df.head(limit)
+
+    metrics = {}
+    if {"y_true", "y_pred"}.issubset(df.columns):
+        err = (df["y_pred"] - df["y_true"]).astype(float)
+        metrics = {
+            "n":    int(len(df)),
+            "mae":  round(float(err.abs().mean()), 4),
+            "rmse": round(float(np.sqrt((err ** 2).mean())), 4),
+            "bias": round(float(err.mean()), 4),
+        }
+    return {
+        "count":   len(df),
+        "metrics": metrics,
+        "data":    df.to_dict(orient="records"),
+    }
+
+
+@app.get("/qos/forecast")
+def qos_forecast(
+    ue_id:  Optional[int] = Query(None),
+    metric: Optional[str] = Query(None, description="jitter_ms | throughput_mbps"),
+    limit:  int = Query(500, le=5000),
+):
+    """Prophet forecast with confidence intervals (DSO1.1)."""
+    if _forecast_ci_df is None:
+        raise HTTPException(503, "DSO1.1 forecast not loaded (forecast_ci.csv)")
+    df = _forecast_ci_df.copy()
+    if ue_id is not None and "ue_id" in df.columns:
+        df = df[df["ue_id"] == ue_id]
+    if metric and "metric" in df.columns:
+        df = df[df["metric"] == metric]
+    df = df.head(limit)
+    metrics_available = sorted(_forecast_ci_df["metric"].dropna().unique().tolist()) if "metric" in _forecast_ci_df.columns else []
+    ues_available = sorted(_forecast_ci_df["ue_id"].dropna().unique().tolist()) if "ue_id" in _forecast_ci_df.columns else []
+    return {
+        "count":    len(df),
+        "metrics_available": metrics_available,
+        "ues_available":     ues_available[:50],
+        "data":     df.to_dict(orient="records"),
+    }
+
+
+# ── M1 SHAP explainability (Member 1) ─────────────────────────────────────────
+
+@app.get("/explain/shap")
+def explain_shap(limit: int = Query(30, le=500)):
+    """Global feature importance from M1's SHAP analysis."""
+    if _shap_df is None:
+        raise HTTPException(503, "SHAP importance not loaded (shap_importance_ns3.xls)")
+    df = _shap_df.copy()
+    return {"count": len(df), "data": df.head(limit).to_dict(orient="records")}
+
+
+# ── M3 Live Counterfactual (Member 3) ─────────────────────────────────────────
+
+@app.post("/causal/counterfactual")
+def causal_counterfactual(req: CounterfactualRequest):
+    """Live DoWhy counterfactual estimate. Falls back to CSV lookup if model absent."""
+    if _dowhy_model is not None:
+        try:
+            # DoWhy `CausalModel` workflow: identify → estimate → scale to (cf - obs).
+            model = _dowhy_model
+            identified_estimand = model.identify_effect(proceed_when_unidentifiable=True)
+            estimate = model.estimate_effect(
+                identified_estimand,
+                method_name="backdoor.linear_regression",
+                target_units="ate",
+            )
+            ate = float(estimate.value)
+            delta = float(req.counterfactual) - float(req.treatment_val)
+            return {
+                "source":            "dowhy_model",
+                "treatment":         req.treatment,
+                "observed":          req.treatment_val,
+                "counterfactual":    req.counterfactual,
+                "ate":               round(ate, 6),
+                "estimated_effect":  round(ate * delta, 6),
+                "method":            "backdoor.linear_regression",
+            }
+        except Exception as e:
+            log.warning(f"DoWhy live estimate failed: {e}; falling back to CSV")
+
+    if _cf_df is None:
+        raise HTTPException(503, "Neither DoWhy model nor counterfactuals.csv available")
+    df = _cf_df
+    return {
+        "source":        "counterfactuals_csv",
+        "treatment":     req.treatment,
+        "observed":      req.treatment_val,
+        "counterfactual": req.counterfactual,
+        "note":          "Live DoWhy estimate unavailable; serving pre-computed CF aggregate.",
+        "avg_reduction_pct": round(float(df["reduction_pct"].mean()), 2) if "reduction_pct" in df.columns else None,
+    }
+
+
+# ── M1 Live Anomaly Scoring (Member 1) ────────────────────────────────────────
+
+_ANOMALY_FEATURES = [
+    "sinr_dl_db", "throughput_mbps", "delay_ms", "jitter_ms",
+    "packet_loss_ratio", "prb_utilization", "retransmissions", "load_level",
+]
+
+
+def _build_feature_vector(req: "AnomalyScoreRequest", expected: list[str]) -> np.ndarray:
+    """Pad the 8 base KPIs onto whatever feature list the bundled model expects.
+    Missing engineered features default to 0.0 — acceptable for a UI smoke test,
+    and documented in the response so the user knows."""
+    provided = {f: float(getattr(req, f)) for f in _ANOMALY_FEATURES}
+    vec = [provided.get(col, 0.0) for col in expected]
+    return np.array([vec], dtype=np.float32)
+
+
+@app.post("/anomaly/score")
+def anomaly_score(req: AnomalyScoreRequest):
+    """Score a single KPI window with all loaded v2 supervised models."""
+    if not _anomaly_models:
+        raise HTTPException(503, "No anomaly models loaded (anomaly_models/ empty)")
+
+    results = {}
+    for name, bundle in _anomaly_models.items():
+        try:
+            model   = bundle["model"] if isinstance(bundle, dict) else bundle
+            feat    = bundle.get("features") if isinstance(bundle, dict) else None
+            thr     = (bundle.get("threshold") if isinstance(bundle, dict) else None) or 0.5
+            if feat is None:
+                feat = _ANOMALY_FEATURES
+            x = _build_feature_vector(req, feat)
+
+            if name == "isolation_forest":
+                score = float(-model.score_samples(x)[0])
+                flag  = int(model.predict(x)[0] == -1)
+            else:
+                proba = model.predict_proba(x)[0]
+                score = float(proba[-1])
+                flag  = int(score >= thr)
+            results[name] = {
+                "score":      round(score, 6),
+                "is_anomaly": flag,
+                "n_features_used": len(feat),
+            }
+        except Exception as e:
+            results[name] = {"error": str(e)}
+
+    flagged = [n for n, r in results.items() if isinstance(r.get("is_anomaly"), int) and r["is_anomaly"]]
+    return {
+        "features": {f: getattr(req, f) for f in _ANOMALY_FEATURES},
+        "note":     "Engineered features (rolling means, spike flags, etc.) default to 0 — inference is best-effort from 8 base KPIs.",
+        "results":  results,
+        "ensemble_flag": 1 if len(flagged) >= max(1, len(results) // 2) else 0,
+        "flagged_by":    flagged,
+    }
+
+
+# ── Companion widget: answers contextual questions from every dashboard page ──
+
+_PAGE_CONTEXT = {
+    "kpi": {
+        "short": "the KPI Overview dashboard",
+        "overview": (
+            "This is the KPI Overview — the live pulse of the 5G network. "
+            "You see six top cards: average jitter in milliseconds, packet loss ratio, "
+            "throughput in megabits per second, one-way delay, anomaly rate, and average SINR in decibels. "
+            "Below them are a severity donut, a root-cause breakdown, per-UE packet-loss timelines, "
+            "SINR distribution by load level, and detector agreement. "
+            "Colors follow a traffic-light rule: green means healthy, amber is elevated, red is critical."
+        ),
+        "how_to_read": (
+            "Start with the six KPI cards. If jitter is above 30 ms or packet loss above 5 percent, "
+            "that is already degraded service. Cross-check against the anomaly rate card — a high rate "
+            "with otherwise healthy KPIs usually points to edge-case subtle anomalies rather than hard outages."
+        ),
+    },
+    "anomaly": {
+        "short": "the Anomaly Feed page",
+        "overview": (
+            "This is the Anomaly Feed, task DSO2.2 and DSO2.3. "
+            "It shows the consensus output of our Isolation Forest plus LSTM Autoencoder ensemble, "
+            "with SHAP bars explaining which KPI pushed each event over the threshold. "
+            "The live scorer at the bottom lets you paste a KPI vector and get an instant verdict."
+        ),
+        "how_to_read": (
+            "Rows flagged by both detectors are high-confidence anomalies — act on those first. "
+            "Use the SHAP panel to see whether jitter, loss, or SINR dominated; that tells you where to start debugging."
+        ),
+    },
+    "causal": {
+        "short": "the Causal Root Cause Explorer",
+        "overview": (
+            "This is the Causal Analysis page, task DSO1.2. "
+            "It runs a DoWhy causal model over the network KPIs, shows counterfactual estimates "
+            "(what packet loss would have looked like without the anomaly), and the live estimator "
+            "lets you ask 'what if jitter were 5 ms lower?' style questions."
+        ),
+        "how_to_read": (
+            "The bar chart shows estimated causal effect per root cause. Larger absolute effect means "
+            "that root cause contributed more to the degradation. The counterfactual line shows the gap "
+            "between observed and 'clean-world' packet loss."
+        ),
+    },
+    "forecast": {
+        "short": "the QoS Forecast page",
+        "overview": (
+            "This is the QoS Forecast page, task DSO1.1. "
+            "It overlays XGBoost jitter and throughput predictions against actuals, plus Prophet "
+            "confidence bands per UE and per metric. Widening bands mean the model is less sure."
+        ),
+        "how_to_read": (
+            "Pick a UE and a metric. If the predicted line diverges from actuals and the Prophet bands "
+            "are narrow, that is a real regime shift worth investigating. Wide bands with a stable actual "
+            "just mean volatility in the training window."
+        ),
+    },
+    "sla_risk": {
+        "short": "the SLA Breach Risk page",
+        "overview": (
+            "This is the SLA Breach Risk page, task DSO2.1. "
+            "It shows XGBoost early-warning predictions for upcoming SLA breaches, broken down by load level."
+        ),
+        "how_to_read": (
+            "High-risk rows at low load usually indicate configuration issues; high risk under heavy load "
+            "typically points to capacity. Sort by predicted probability and act on the top slice."
+        ),
+    },
+    "severity": {
+        "short": "the Severity Triage page",
+        "overview": (
+            "This is the Severity Triage page. It classifies every event as critical, degraded, or normal, "
+            "and visualizes the breakdown per UE and per root cause."
+        ),
+        "how_to_read": (
+            "The critical slice is your oncall queue. Degraded is for the next-business-day triage. "
+            "Use the per-UE facet to see whether one device is dragging the fleet numbers."
+        ),
+    },
+    "benchmark": {
+        "short": "the Benchmarking page",
+        "overview": (
+            "This is the Benchmarking page. It compares our anomaly detectors head-to-head on F1, "
+            "precision, and recall, so you can judge which model to trust on new data."
+        ),
+        "how_to_read": (
+            "Prefer models with high F1 and balanced precision-recall. A model with very high precision "
+            "but low recall misses real anomalies; the opposite floods the NOC with false positives."
+        ),
+    },
+    "rl": {
+        "short": "the RL Actions page",
+        "overview": (
+            "This is the RL Actions page, task DSO3.1. "
+            "It shows the PPO agent's live advisor (what action it would recommend for the current KPI vector), "
+            "the historical distribution of recommended actions over anomalous events, and a digital-twin simulation."
+        ),
+        "how_to_read": (
+            "The top card names the most common recommended action across anomalies: monitor closely, "
+            "analyze time-series, investigate multivariate, inspect individual, or high-confidence alert. "
+            "The pie chart shows frequency; the advisor panel takes a KPI vector and returns the policy action."
+        ),
+    },
+    "chat": {
+        "short": "the Ask the Network RAG chat",
+        "overview": (
+            "This is the Ask the Network page — the full RAG chat interface. "
+            "It retrieves relevant KPI windows from ChromaDB and answers with llama3.2 via Ollama, "
+            "with optional filtering by UE, severity, and root cause."
+        ),
+        "how_to_read": (
+            "Pick the mode first: general, per-UE, or root-cause. Then ask in plain English. "
+            "The retrieved context sources are shown below the answer so you can audit the evidence."
+        ),
+    },
+    "voice": {
+        "short": "the Voice NOC Assistant page",
+        "overview": (
+            "This is the Voice NOC Assistant. A full 3D avatar reacts to your voice — say 'Hey Buddy' "
+            "to trigger listening, then ask any question. The avatar lip-syncs to the TTS answer."
+        ),
+        "how_to_read": (
+            "The status dot on the avatar tells you the state: green idle, amber listening, "
+            "purple processing, red speaking."
+        ),
+    },
+    "export": {
+        "short": "the Export Report page",
+        "overview": (
+            "This is the Export Report page. It produces a branded PDF summary with KPIs, "
+            "anomaly highlights, causal findings, and forecasts — ready for handoff."
+        ),
+        "how_to_read": (
+            "Pick the time range and the sections you want, then click Generate. The PDF is written to disk and downloadable."
+        ),
+    },
+}
+
+# Keywords that trigger the fast, LLM-free overview response.
+_OVERVIEW_KEYWORDS = (
+    "what is this", "what's this", "what is on", "what's on", "what does this page",
+    "explain this", "explain the", "explain it", "give me an overview", "overview",
+    "content of this", "content of the page", "what does this show", "what am i looking at",
+    "tell me about this page", "what does the page", "what page", "what is the",
+    "what are we", "help me understand", "walk me through", "describe this page",
+    "describe the", "how do i read", "how to read", "how does this work",
+)
+_HOW_KEYWORDS = ("how do i read", "how to read", "how do i interpret", "interpret", "read the", "read this")
+
+
+def _companion_fast_answer(page_key: str, question: str) -> Optional[str]:
+    """Return a pre-baked answer if the question is an overview-style ask. None otherwise."""
+    ctx = _PAGE_CONTEXT.get((page_key or "").lower())
+    if not ctx:
+        return None
+    q = (question or "").lower().strip()
+    if not q:
+        return ctx.get("overview")
+    # Any overview-style phrasing → rich overview.
+    if any(kw in q for kw in _OVERVIEW_KEYWORDS):
+        ans = ctx.get("overview", "")
+        how = ctx.get("how_to_read", "")
+        if any(kw in q for kw in _HOW_KEYWORDS) and how:
+            return how
+        return (ans + " " + how).strip() if how else ans
+    return None
+
+
+class CompanionAskRequest(BaseModel):
+    question: str = Field(..., min_length=1)
+    page:     Optional[str] = Field(None, description="current dashboard page key")
+
+
+@app.post("/companion/ask")
+def companion_ask(req: CompanionAskRequest):
+    """Answer a question about the current page.
+
+    Strategy:
+    1. Fast path — if the question is overview-style, return the pre-baked page explanation
+       immediately (no LLM, sub-100ms). This handles 'explain this page', 'what is this',
+       'give me an overview', 'how do I read this', etc.
+    2. Specific path — hand to the RAG chain for targeted questions. If RAG fails or is
+       unavailable, fall back to the rich page overview so the user is never stuck.
+    """
+    page_key  = (req.page or "").lower()
+    ctx       = _PAGE_CONTEXT.get(page_key, {})
+    page_hint = ctx.get("short", "")
+
+    # 1. Fast path
+    fast = _companion_fast_answer(page_key, req.question)
+    if fast:
+        return {"answer": fast, "page": req.page, "source": "context"}
+
+    # 2. RAG path
+    if _collection is not None and _embed_model is not None and _chain is not None:
+        try:
+            from rag.rag_pipeline import query_rag
+            framed = (
+                f"The user is currently viewing {page_hint}. "
+                f"Answer this question briefly and clearly, as a NOC companion, in two to four sentences: {req.question}"
+            ) if page_hint else req.question
+            result = query_rag(
+                question=framed,
+                collection=_collection,
+                embed_model=_embed_model,
+                chain=_chain,
+                mode="general",
+                ue_id=None,
+                severity_filter=None,
+                root_cause_filter=None,
+            )
+            answer = (result.get("answer") or "").strip()
+            if answer:
+                return {"answer": answer, "page": req.page, "source": "rag"}
+        except Exception as e:
+            log.warning(f"Companion RAG call failed: {e}")
+
+    # 3. Fallback — always return the rich page overview so the user never sees a blank error.
+    fallback = ctx.get("overview") or "I don't have context for this page yet."
+    how = ctx.get("how_to_read")
+    if how:
+        fallback = fallback + " " + how
+    return {"answer": fallback, "page": req.page, "source": "fallback"}
 
 
 # ── Voice transcript store ──

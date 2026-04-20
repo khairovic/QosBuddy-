@@ -34,9 +34,13 @@ COPY --from=builder /usr/local/lib/python3.11/site-packages \
 COPY --from=builder /usr/local/bin /usr/local/bin
 
 # Copy application code
-COPY rag/       ./rag/
-COPY dashboard/ ./dashboard/
-COPY api/       ./api/
+COPY rag/            ./rag/
+COPY dashboard/      ./dashboard/
+COPY api/            ./api/
+COPY rl_agent/       ./rl_agent/
+COPY qos_forecast/   ./qos_forecast/
+COPY causal_models/  ./causal_models/
+COPY anomaly_models/ ./anomaly_models/
 
 # ── Environment variables ────────────────────────────────────────────────────
 # Mount your data directory here: docker run -v /path/to/data:/app/data ...
