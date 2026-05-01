@@ -1,0 +1,101 @@
+{
+  "feature_cols": [
+    "prb_utilization",
+    "retransmissions",
+    "mcs_dl",
+    "load_level",
+    "mobility_speed",
+    "shadowing_enabled",
+    "prb_load_ratio",
+    "retx_rate",
+    "mcs_efficiency",
+    "load_x_prb",
+    "retx_per_load",
+    "dist_norm",
+    "gnb_id",
+    "prb_utilization_roll3",
+    "retransmissions_roll3",
+    "mcs_dl_roll3",
+    "prb_utilization_roll3_std",
+    "retransmissions_roll3_std"
+  ],
+  "label_ingredients": [
+    "sinr_dl_db",
+    "throughput_mbps",
+    "delay_ms",
+    "packet_loss_ratio",
+    "jitter_ms",
+    "cqi"
+  ],
+  "lstm_features": [
+    "prb_utilization",
+    "retransmissions",
+    "mcs_dl",
+    "load_level",
+    "mobility_speed",
+    "shadowing_enabled",
+    "prb_load_ratio",
+    "retx_rate",
+    "mcs_efficiency",
+    "dist_norm",
+    "gnb_id"
+  ],
+  "seq_len": 10,
+  "best_threshold": 0.6696407198905945,
+  "load_thresholds": {
+    "default": 0.67,
+    "load_1": 0.737,
+    "load_2": 0.703,
+    "load_3": 0.67,
+    "load_4": 0.603,
+    "load_5": 0.569
+  },
+  "seq_models_kept": [
+    "BiLSTM",
+    "GRU+Attn"
+  ],
+  "seq_model_dropped": "TCN (removed)",
+  "seq_thresholds": {
+    "BiLSTM": 0.0387,
+    "GRU+Attn": 0.0387
+  },
+  "tst_threshold": 0.0397,
+  "test_aucs": {
+    "xgboost": 0.9961,
+    "BiLSTM": 0.9446,
+    "GRU+Attn": 0.943,
+    "tst": 0.9419
+  },
+  "geo_cols": [
+    "ue_name",
+    "gnb_id",
+    "gnb_name",
+    "ue_lat",
+    "ue_lon",
+    "ue_dist_to_gnb_m",
+    "gnb_lat",
+    "gnb_lon"
+  ],
+  "gnb_towers": [
+    {
+      "gnb_id": 1,
+      "gnb_name": "gNB_Tunis_Lac",
+      "gnb_lat": 36.832,
+      "gnb_lon": 10.23
+    },
+    {
+      "gnb_id": 2,
+      "gnb_name": "gNB_Tunis_Centre",
+      "gnb_lat": 36.819,
+      "gnb_lon": 10.1658
+    },
+    {
+      "gnb_id": 3,
+      "gnb_name": "gNB_Ariana",
+      "gnb_lat": 36.8665,
+      "gnb_lon": 10.1647
+    }
+  ],
+  "dataset": "5g_dataset_scaled",
+  "version": "v11_lr_fixed_platt"
+}
