@@ -7,7 +7,7 @@ from gymnasium import spaces
 
 class QoSNetworkEnv(gym.Env):
     """
-    Digital Twin Gymnasium environment backed by real NS-3 LENA data.
+    Digital Twin Gymnasium environment backed by real NS-3 5G data (5g_dataset2.csv).
 
     Observation (8 floats):
         [sinr_dl_db, throughput_mbps, delay_ms, jitter_ms,
@@ -24,10 +24,12 @@ class QoSNetworkEnv(gym.Env):
     metadata = {"render_modes": ["human"]}
     ACTION_NAMES = {0: "reroute", 1: "throttle", 2: "prioritize", 3: "no_action"}
 
+    # SLA thresholds recalibrated for 5g_dataset2.csv
+    # (SINR typically -30 to +5 dB, packet_loss 0.75-0.97, delay 135-268 ms)
     SLA = {
-        1: {"sinr": -25.0, "delay": 300.0, "loss": 0.80, "tput": 0.01},
-        2: {"sinr": -18.0, "delay": 200.0, "loss": 0.60, "tput": 0.05},
-        3: {"sinr": -10.0, "delay": 120.0, "loss": 0.30, "tput": 0.20},
+        1: {"sinr": -15.0, "delay": 250.0, "loss": 0.85, "tput": 0.05},
+        2: {"sinr": -10.0, "delay": 180.0, "loss": 0.75, "tput": 0.15},
+        3: {"sinr":  -5.0, "delay": 120.0, "loss": 0.60, "tput": 0.30},
     }
 
     ACTION_FX = {
@@ -37,8 +39,8 @@ class QoSNetworkEnv(gym.Env):
         3: {"sinr": -1.5,  "delay": 1.10, "loss": 1.05, "tput": 0.95},
     }
 
-    OBS_LOW  = np.array([-50,  0,    0,   0,   0,   0,   0,  0], dtype=np.float32)
-    OBS_HIGH = np.array([ 90, 100, 5000, 2000, 1, 100, 1000, 10], dtype=np.float32)
+    OBS_LOW  = np.array([-50,  0,    0,   0,   0,  0,   0,  0], dtype=np.float32)
+    OBS_HIGH = np.array([ 90, 100, 5000, 2000, 1, 10, 600, 10], dtype=np.float32)
     OBS_COLS = ['sinr_dl_db','throughput_mbps','delay_ms','jitter_ms',
                 'packet_loss_ratio','prb_utilization','retransmissions','sla_risk_score']
 
@@ -71,7 +73,7 @@ class QoSNetworkEnv(gym.Env):
         df = df[~((df['throughput_mbps'] == 0) & (df['delay_ms'] == 0))]
         df = df[(df['sinr_dl_db'].between(-50,90)) & (df['throughput_mbps'].between(0,100)) &
                 (df['delay_ms'].between(0,5000)) & (df['packet_loss_ratio'].between(0,1)) &
-                (df['prb_utilization'].between(0,100)) & (df['cqi'].between(1,15)) &
+                (df['prb_utilization'].between(0,10)) & (df['cqi'].between(0,15)) &
                 (df['load_level'].between(1,3))]
         df = df.sort_values(['ue_id','timestamp']).reset_index(drop=True)
         self._data = df
@@ -101,14 +103,15 @@ class QoSNetworkEnv(gym.Env):
                 'retransmissions':   float(row['retransmissions']),
                 'load_level':        int(row['load_level']),
             }
+        # Fallback random values calibrated to 5g_dataset2.csv ranges
         return {
-            'sinr_dl_db':        float(np.random.normal(-8, 15)),
-            'throughput_mbps':   float(np.clip(np.random.exponential(2), 0, 100)),
-            'delay_ms':          float(np.clip(np.random.exponential(80), 0, 5000)),
-            'jitter_ms':         float(np.clip(np.random.exponential(30), 0, 2000)),
-            'packet_loss_ratio': float(np.clip(np.random.beta(1, 8), 0, 1)),
-            'prb_utilization':   float(np.random.randint(5, 80)),
-            'retransmissions':   float(np.random.randint(0, 20)),
+            'sinr_dl_db':        float(np.random.normal(-12, 7)),
+            'throughput_mbps':   float(np.clip(np.random.exponential(0.3), 0, 100)),
+            'delay_ms':          float(np.clip(np.random.uniform(130, 270), 0, 5000)),
+            'jitter_ms':         float(np.clip(np.random.exponential(10), 0, 2000)),
+            'packet_loss_ratio': float(np.clip(np.random.uniform(0.75, 0.97), 0, 1)),
+            'prb_utilization':   float(np.random.randint(1, 11)),
+            'retransmissions':   float(np.random.randint(0, 601)),
             'load_level':        int(np.random.randint(1, 4)),
         }
 
@@ -121,8 +124,8 @@ class QoSNetworkEnv(gym.Env):
             'delay_ms':          float(np.clip(raw['delay_ms'] * fx['delay'] + n(5), 0, 5000)),
             'jitter_ms':         float(np.clip(raw['jitter_ms'] + n(2), 0, 2000)),
             'packet_loss_ratio': float(np.clip(raw['packet_loss_ratio'] * fx['loss'], 0, 1)),
-            'prb_utilization':   float(np.clip(raw['prb_utilization'] + n(3), 0, 100)),
-            'retransmissions':   float(np.clip(raw['retransmissions'] * fx['loss'] + n(1), 0, 1000)),
+            'prb_utilization':   float(np.clip(raw['prb_utilization'] + n(1), 0, 10)),
+            'retransmissions':   float(np.clip(raw['retransmissions'] * fx['loss'] + n(10), 0, 600)),
             'load_level':        raw['load_level'],
         }
 

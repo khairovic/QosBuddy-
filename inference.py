@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 inference.py - Load trained PPO agent and run on QoSNetworkEnv.
-Usage: python inference.py [--episodes 10] [--dataset lena_dataset_cleaned.csv]
+Usage: python inference.py [--episodes 10] [--dataset 5g_dataset2.csv]
 """
 import os, sys, argparse
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
@@ -13,7 +13,7 @@ from QoSNetworkEnv import QoSNetworkEnv
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--episodes', type=int, default=10)
-    parser.add_argument('--dataset',  type=str, default='lena_dataset_cleaned.csv')
+    parser.add_argument('--dataset',  type=str, default='5g_dataset2.csv')
     parser.add_argument('--model',    type=str, default='ppo_qos_agent_best')
     args = parser.parse_args()
 
