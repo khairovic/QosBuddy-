@@ -1,29 +1,13 @@
-strict digraph {
-score_isolation_forest [layer=treatment];
-score_copod [layer=treatment];
-"score_one-class_svm" [layer=treatment];
-score_lstm_autoencoder [layer=treatment];
-score_anomaly_transformer [layer=treatment];
-score_tranad [layer=treatment];
-score_random_forest_supervised [layer=mediator];
-score_xgboost_supervised [layer=mediator];
-score_gradient_boosting_supervised [layer=mediator];
-true_label [layer=outcome];
-severity_encoded [layer=outcome];
-score_isolation_forest -> score_xgboost_supervised;
-score_isolation_forest -> score_random_forest_supervised;
-score_copod -> score_xgboost_supervised;
-score_copod -> score_random_forest_supervised;
-score_copod -> true_label;
-"score_one-class_svm" -> score_xgboost_supervised;
-"score_one-class_svm" -> score_random_forest_supervised;
-score_lstm_autoencoder -> score_xgboost_supervised;
-score_anomaly_transformer -> score_xgboost_supervised;
-score_anomaly_transformer -> true_label;
-score_tranad -> score_xgboost_supervised;
-score_tranad -> true_label;
-score_random_forest_supervised -> true_label;
-score_xgboost_supervised -> true_label;
-score_gradient_boosting_supervised -> true_label;
-true_label -> severity_encoded;
+
+digraph {
+    load_level          -> packet_loss_ratio;
+    mobility_speed      -> packet_loss_ratio;
+    shadowing_enabled   -> sinr_dl_db;
+    sinr_dl_db          -> packet_loss_ratio;
+    sinr_dl_db          -> jitter_ms;
+    load_level          -> prb_utilization;
+    mobility_speed      -> retransmissions;
+    packet_loss_ratio   -> throughput_mbps;
+    jitter_ms           -> delay_ms;
+    prb_utilization     -> throughput_mbps;
 }
