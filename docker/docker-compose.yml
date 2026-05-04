@@ -1,7 +1,5 @@
 # QoSBuddy M6 — Docker Compose Stack
-
 services:
-
   # ── 1. Ollama — local LLM server ──────────────────────────────────────────
   ollama:
     image: ollama/ollama:latest
@@ -46,7 +44,8 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - ../data:/app/data:ro
+      # data is read-write so live_log.jsonl + mlops *_live.csv outputs can be written
+      - ../data:/app/data
       - chroma_store:/app/chroma_store
       - ../rag:/app/rag:ro
       - ../api:/app/api:ro
@@ -54,16 +53,21 @@ services:
       - ../qos_forecast:/app/qos_forecast:ro
       - ../causal_models:/app/causal_models:ro
       - ../anomaly_models:/app/anomaly_models:ro
+      - ../mlops:/app/mlops:ro
     environment:
       - QOSBUDDY_DATA_DIR=/app/data
       - QOSBUDDY_CHROMA_DIR=/app/chroma_store
       - OLLAMA_BASE_URL=http://ollama:11434
+      - QOSBUDDY_PIPELINE_INTERVAL=300
+      - QOSBUDDY_PIPELINE_THRESHOLD=100
+      - QOSBUDDY_PIPELINE_AUTO=true
     depends_on:
       kb-builder:
         condition: service_completed_successfully
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      # FIX: wrapped in shell so a non-zero exit is properly caught
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\" && echo ok"]
       interval: 15s
       timeout: 10s
       retries: 10
@@ -78,10 +82,12 @@ services:
     ports:
       - "8501:8501"
     volumes:
+      # dashboard reads *_live.csv files the API/mlops jobs drop here
       - ../data:/app/data:ro
       - chroma_store:/app/chroma_store
       - ../rag:/app/rag:ro
       - ../dashboard:/app/dashboard:ro
+      - ../mlops:/app/mlops:ro
     environment:
       - QOSBUDDY_DATA_DIR=/app/data
       - QOSBUDDY_CHROMA_DIR=/app/chroma_store
@@ -89,8 +95,18 @@ services:
       - QOSBUDDY_API_URL=http://qosbuddy-api:8000
     depends_on:
       qosbuddy-api:
-        condition: service_healthy
+        # FIX: changed from service_healthy to service_started so the dashboard
+        # is not permanently blocked when the API takes long to become healthy.
+        condition: service_started
     restart: unless-stopped
+    healthcheck:
+      # FIX: dashboard now checks its OWN port (8501), not the API's port.
+      # The API URL used inside the dashboard uses the service name, not localhost.
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health')\" && echo ok"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
 
 volumes:
   ollama_models:

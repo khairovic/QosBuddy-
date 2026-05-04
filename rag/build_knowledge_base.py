@@ -521,7 +521,9 @@ Suggested Action: {action_hint}
             "risk_proba":  round(prob, 4),
             "severity":    "critical" if prob > 0.85 else "degraded",
         })
-        ids.append(f"sla_risk_ue{ue_id}_ts{ts}")
+        # Include row index — Eya's v11 SLA dataset has multiple snapshots per
+        # (ue_id, timestamp), so the (ue,ts) key alone is no longer unique.
+        ids.append(f"sla_risk_ue{ue_id}_ts{ts}_r{idx}")
         documents.append(doc)
 
     log.info(f"Built {len(documents)} SLA_RISK documents")

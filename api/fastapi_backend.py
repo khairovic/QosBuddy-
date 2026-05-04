@@ -16,7 +16,10 @@ v2 changes:
 
 import logging
 import os
+from collections import deque
+import threading
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
@@ -52,7 +55,62 @@ _dowhy_model   = None   # dowhy_model.pkl (M3, live counterfactual)
 _anomaly_models = {}    # v2 supervised models (IF, XGB) loaded from anomaly_models/
 _data_version  = "v1"   # "v1" or "v2"
 
+# Live simulation buffer (circular, keeps last 500 rows from bridge.py)
+_LIVE_BUFFER_SIZE = 500
+_live_buffer: deque = deque(maxlen=_LIVE_BUFFER_SIZE)
+_live_lock = threading.Lock()
+_live_stats = {
+    "total_received": 0,
+    "last_received_ts": None,
+    "bridge_connected": False,
+    "rows_in_buffer": 0,
+}
+
 DATA_DIR = Path(os.getenv("QOSBUDDY_DATA_DIR", "./data"))
+
+# ── Live data persistence ────────────────────────────────────────────────
+# Append-only JSONL log of every row received from the bridge. Survives
+# container restarts and is read directly by the dashboard for the cumulative
+# augmented dataset that powers the cross-page analytics.
+LIVE_LOG_PATH = DATA_DIR / "live_log.jsonl"
+_live_log_lock = threading.Lock()
+
+
+def _append_live_log(scored_rows: List[dict]) -> int:
+    """Append scored rows to the JSONL log. Returns the number of lines written."""
+    if not scored_rows:
+        return 0
+    import json as _json
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        # Drop non-JSON-serializable values (numpy types, etc.) defensively.
+        def _clean(r):
+            out = {}
+            for k, v in r.items():
+                try:
+                    _json.dumps(v)
+                    out[k] = v
+                except (TypeError, ValueError):
+                    out[k] = str(v)
+            return out
+        with _live_log_lock, open(LIVE_LOG_PATH, "a", encoding="utf-8") as f:
+            for r in scored_rows:
+                f.write(_json.dumps(_clean(r), ensure_ascii=False) + "\n")
+        return len(scored_rows)
+    except Exception as e:
+        log.warning(f"live_log append failed: {e}")
+        return 0
+
+
+def _count_live_log_lines() -> int:
+    """Cheap line count for restoring the cumulative counter on startup."""
+    if not LIVE_LOG_PATH.exists():
+        return 0
+    try:
+        with open(LIVE_LOG_PATH, "rb") as f:
+            return sum(1 for _ in f)
+    except Exception:
+        return 0
 
 
 def _safe_load_csv(filename: str, label: str) -> Optional[pd.DataFrame]:
@@ -79,6 +137,15 @@ async def lifespan(app: FastAPI):
     global _jitter_pred_df, _forecast_ci_df, _shap_df, _dowhy_model, _anomaly_models
 
     log.info("QoSBuddy M6 API v2 starting up…")
+
+    # ── Restore cumulative counter from persistent live log ──
+    try:
+        prior = _count_live_log_lines()
+        if prior > 0:
+            _live_stats["total_received"] = prior
+            log.info(f"Live log: restored {prior:,} cumulative rows from {LIVE_LOG_PATH.name}")
+    except Exception as e:
+        log.warning(f"Live log restore skipped: {e}")
 
     # ── Load anomaly scores (prefer v2, fallback v1) ──
     _anomaly_v2_df = _safe_load_csv("anomaly_scores_v2.csv", "Anomaly scores v2")
@@ -198,9 +265,26 @@ async def lifespan(app: FastAPI):
             except Exception as e:
                 log.warning(f"Anomaly model {name} load failed: {e}")
 
+    # ── MLOps: register scoring jobs + optionally auto-start scheduler ──
+    try:
+        from mlops import runner as _mlops_runner, register_default_jobs
+        register_default_jobs()
+        if _mlops_runner.auto_start_on_boot:
+            _mlops_runner.start_scheduler()
+            log.info("MLOps scheduler auto-started")
+        else:
+            log.info("MLOps registered but scheduler is paused (set QOSBUDDY_PIPELINE_AUTO=true to auto-start)")
+    except Exception as e:
+        log.warning(f"MLOps init skipped: {e}")
+
     log.info(f"Startup complete. Data version: {_data_version}")
     yield
     log.info("QoSBuddy M6 API shutting down")
+    try:
+        from mlops import runner as _mlops_runner
+        _mlops_runner.stop_scheduler()
+    except Exception:
+        pass
 
 
 app = FastAPI(
@@ -336,11 +420,15 @@ class KPISummary(BaseModel):
 @app.get("/health")
 def health():
     """Health check — confirms API, data, and RAG are all live."""
+    try:
+        kb_docs = _collection.count() if _collection else 0
+    except Exception:
+        kb_docs = 0          # ChromaDB collection deleted/reset — non-fatal
     return {
         "status":       "ok",
         "data_version": _data_version,
         "rag_ready":    _collection is not None,
-        "kb_docs":      _collection.count() if _collection else 0,
+        "kb_docs":      kb_docs,
         "v1_loaded":    _anomaly_df is not None,
         "v2_loaded":    _anomaly_v2_df is not None,
         "v1_rows":      len(_anomaly_df) if _anomaly_df is not None else 0,
@@ -762,27 +850,56 @@ def rl_benchmark():
 @app.get("/qos/predictions")
 def qos_predictions(
     ue_id:  Optional[int] = Query(None),
-    limit:  int = Query(500, le=5000),
+    limit:  int  = Query(2000, le=100000),
+    source: str  = Query("auto", regex="^(auto|static|live)$",
+                         description="auto = static + live concat; static = CSV only; live = MLOps output only"),
 ):
-    """Return XGBoost jitter predictions (y_true vs y_pred) from DSO1.1."""
-    if _jitter_pred_df is None:
-        raise HTTPException(503, "DSO1.1 predictions not loaded (predicted_jitter.csv)")
-    df = _jitter_pred_df.copy()
+    """Return XGBoost jitter predictions (y_true vs y_pred) from DSO1.1.
+
+    `auto` concatenates the static `predicted_jitter.csv` with the live
+    `predicted_jitter_live.csv` produced by the MLOps `score_qos_forecast`
+    job, so the page reflects both historical eval and live scoring.
+    """
+    parts: List[pd.DataFrame] = []
+    src_used: List[str] = []
+
+    if source in ("auto", "static") and _jitter_pred_df is not None:
+        parts.append(_jitter_pred_df.copy()); src_used.append("static")
+
+    live_path = DATA_DIR / "predicted_jitter_live.csv"
+    if source in ("auto", "live") and live_path.exists():
+        try:
+            live = pd.read_csv(live_path)
+            if not live.empty:
+                parts.append(live); src_used.append("live")
+        except Exception as e:
+            log.warning(f"qos predictions live read failed: {e}")
+
+    if not parts:
+        raise HTTPException(503, "DSO1.1 predictions not available (no static CSV, no live output)")
+
+    df = pd.concat(parts, ignore_index=True, sort=False) if len(parts) > 1 else parts[0]
     if ue_id is not None and "ue_id" in df.columns:
         df = df[df["ue_id"] == ue_id]
-    df = df.head(limit)
+    # Take the *tail* — newest rows are at the end of the live log
+    df = df.tail(limit) if limit > 0 else df
 
     metrics = {}
     if {"y_true", "y_pred"}.issubset(df.columns):
-        err = (df["y_pred"] - df["y_true"]).astype(float)
-        metrics = {
-            "n":    int(len(df)),
-            "mae":  round(float(err.abs().mean()), 4),
-            "rmse": round(float(np.sqrt((err ** 2).mean())), 4),
-            "bias": round(float(err.mean()), 4),
-        }
+        yt = pd.to_numeric(df["y_true"], errors="coerce")
+        yp = pd.to_numeric(df["y_pred"], errors="coerce")
+        ok = yt.notna() & yp.notna()
+        if ok.any():
+            err = (yp[ok] - yt[ok])
+            metrics = {
+                "n":    int(ok.sum()),
+                "mae":  round(float(err.abs().mean()), 4),
+                "rmse": round(float(np.sqrt((err ** 2).mean())), 4),
+                "bias": round(float(err.mean()), 4),
+            }
     return {
-        "count":   len(df),
+        "count":   int(len(df)),
+        "sources": src_used,
         "metrics": metrics,
         "data":    df.to_dict(orient="records"),
     }
@@ -1062,6 +1179,23 @@ _PAGE_CONTEXT = {
             "Pick the time range and the sections you want, then click Generate. The PDF is written to disk and downloadable."
         ),
     },
+    "live_monitor": {
+        "short": "the Live Network Monitor page",
+        "overview": (
+            "This is the Live Network Monitor — a real-time view of the NS-3 simulation feed. "
+            "It connects to the teammate's NS-3 LENA simulator via bridge.py, which watches "
+            "the simulation output CSV and streams new rows to the API over HTTP. "
+            "Each incoming row is scored by anomaly detection models (IF, RF, GBT) and the PPO RL agent "
+            "in real-time. The page shows live KPI time series, anomaly flags, RL action recommendations, "
+            "and model score charts that auto-refresh every few seconds."
+        ),
+        "how_to_read": (
+            "Check the green/red status banner at the top — green means bridge.py is actively sending data. "
+            "The KPI cards show current averages. The time series tabs let you switch between metrics. "
+            "Red triangle markers on the charts indicate anomaly-flagged points. "
+            "The RL Agent section shows what action the PPO recommends for each data point."
+        ),
+    },
 }
 
 # Keywords that trigger the fast, LLM-free overview response.
@@ -1149,6 +1283,239 @@ def companion_ask(req: CompanionAskRequest):
     if how:
         fallback = fallback + " " + how
     return {"answer": fallback, "page": req.page, "source": "fallback"}
+
+
+# ── Live NS-3 Bridge endpoints ────────────────────────────────────────────────
+
+def _score_and_buffer(rows: list):
+    """Score rows with ML models + RL agent and push to buffer.
+    Runs in a background thread so /ingest/live returns immediately."""
+    import time as _time
+
+    def _score_row(row):
+        row["_server_ts"]  = _time.time()
+        row["_server_iso"] = datetime.now().isoformat()
+
+        # Anomaly models
+        if _anomaly_models:
+            try:
+                scores = {}
+                for name, bundle in _anomaly_models.items():
+                    model = bundle["model"] if isinstance(bundle, dict) else bundle
+                    feat  = bundle.get("features") if isinstance(bundle, dict) else None
+                    if feat is None:
+                        feat = ["sinr_dl_db", "throughput_mbps", "delay_ms",
+                                "jitter_ms", "packet_loss_ratio", "prb_utilization",
+                                "retransmissions", "load_level"]
+                    vec = [float(row.get(f, 0.0)) for f in feat]
+                    x   = np.array([vec], dtype=np.float32)
+                    if name == "isolation_forest":
+                        scores[name] = float(-model.score_samples(x)[0])
+                    else:
+                        try:
+                            scores[name] = float(model.predict_proba(x)[0][-1])
+                        except Exception:
+                            scores[name] = 0.0
+                row["_live_scores"]  = scores
+                row["_live_anomaly"] = int(
+                    sum(1 for s in scores.values() if s > 0.5)
+                    >= max(1, len(scores) // 2)
+                )
+            except Exception:
+                row["_live_scores"]  = {}
+                row["_live_anomaly"] = 0
+
+        # RL agent
+        if _rl_policy and _rl_policy.ready:
+            try:
+                obs  = [float(row.get(k, 0)) for k in
+                        ["sinr_dl_db","throughput_mbps","delay_ms","jitter_ms",
+                         "packet_loss_ratio","prb_utilization","retransmissions"]] + [0.0]
+                pred = _rl_policy.predict(obs)
+                row["_rl_action"] = pred["action_name"]
+                row["_rl_probs"]  = pred["probabilities"]
+            except Exception:
+                row["_rl_action"] = "unknown"
+                row["_rl_probs"]  = {}
+        return row
+
+    scored = [_score_row(r) for r in rows]
+    with _live_lock:
+        for r in scored:
+            _live_buffer.append(r)
+        # NOTE: total_received is incremented in /ingest/live (the entry point);
+        # don't double-count here. We just refresh the buffer-size stat.
+        _live_stats["bridge_connected"]  = True
+        _live_stats["rows_in_buffer"]    = len(_live_buffer)
+    # Persist scored rows to the JSONL log (outside the buffer lock so file
+    # I/O doesn't block the live read path).
+    _append_live_log(scored)
+
+
+@app.post("/ingest/live")
+async def ingest_live(payload: dict):
+    """Receive live rows from bridge.py.
+    Returns immediately — scoring happens in a background thread."""
+    rows = payload.get("rows", [])
+    if not rows:
+        raise HTTPException(400, "No rows in payload")
+
+    # Stamp arrival time right away so bridge_connected stays fresh
+    import time as _time
+    ts  = _time.time()
+    iso = datetime.now().isoformat()
+    for row in rows:
+        row.setdefault("_server_ts",  ts)
+        row.setdefault("_server_iso", iso)
+
+    # Update stats immediately so the dashboard sees the connection
+    with _live_lock:
+        _live_stats["total_received"]   += len(rows)
+        _live_stats["last_received_ts"]  = iso
+        _live_stats["bridge_connected"]  = True
+
+    # Score + buffer in background — never blocks the bridge
+    t = threading.Thread(target=_score_and_buffer, args=(rows,), daemon=True)
+    t.start()
+
+    return {
+        "status":         "ok",
+        "received":       len(rows),
+        "buffer_size":    len(_live_buffer),
+        "total_received": _live_stats["total_received"],
+    }
+
+
+@app.get("/live/stream")
+def live_stream(
+    last_n: int = Query(50, le=500),
+    since_ts: Optional[float] = Query(None),
+):
+    """Dashboard polls this for latest live data from the buffer."""
+    with _live_lock:
+        if since_ts:
+            rows = [r for r in _live_buffer if r.get("_server_ts", 0) > since_ts]
+        else:
+            rows = list(_live_buffer)[-last_n:]
+    return {
+        "count": len(rows),
+        "buffer_total": len(_live_buffer),
+        "stats": dict(_live_stats),
+        "data": rows,
+    }
+
+
+@app.get("/live/status")
+def live_status():
+    """Check if bridge.py is connected and sending data."""
+    connected = False
+    if _live_stats["last_received_ts"]:
+        try:
+            last = datetime.fromisoformat(_live_stats["last_received_ts"])
+            age = (datetime.now() - last).total_seconds()
+            connected = age < 30
+        except Exception:
+            pass
+    # Persistent log size for the dashboard's augmentation logic.
+    log_size = 0
+    log_bytes = 0
+    try:
+        if LIVE_LOG_PATH.exists():
+            log_bytes = LIVE_LOG_PATH.stat().st_size
+            log_size  = _count_live_log_lines()
+    except Exception:
+        pass
+    return {
+        "bridge_connected": connected,
+        "total_received": _live_stats["total_received"],
+        "buffer_size": len(_live_buffer),
+        "last_received": _live_stats["last_received_ts"],
+        "log_rows":  log_size,
+        "log_bytes": log_bytes,
+        "log_path":  str(LIVE_LOG_PATH.name),
+    }
+
+
+@app.get("/live/log")
+def live_log(last_n: int = Query(2000, ge=1, le=50000)):
+    """Read the last N rows from the persistent JSONL log.
+
+    Used by the dashboard to feed the cumulative augmented dataset into the
+    KPI / Anomaly / RL pages. Returns rows oldest-first so concat with the
+    static CSV preserves chronological order.
+    """
+    import json as _json
+    if not LIVE_LOG_PATH.exists():
+        return {"count": 0, "data": []}
+    try:
+        # Tail-read the last N lines. For very large files we read from the end
+        # by chunks; for typical sizes here, reading whole and slicing is fine.
+        with open(LIVE_LOG_PATH, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        tail = lines[-last_n:]
+        rows = []
+        for line in tail:
+            line = line.strip()
+            if not line: continue
+            try:
+                rows.append(_json.loads(line))
+            except Exception:
+                continue
+        return {"count": len(rows), "log_total": len(lines), "data": rows}
+    except Exception as e:
+        log.warning(f"/live/log read failed: {e}")
+        return {"count": 0, "data": [], "error": str(e)}
+
+
+# ── MLOps pipeline endpoints ────────────────────────────────────────────
+# The pipeline reads data/live_log.jsonl and refreshes the *_live.csv files
+# the dashboard concats with the static historical CSVs. See mlops/.
+
+class PipelineRunRequest(BaseModel):
+    job: Optional[str] = Field(None, description="job name; omit to run all")
+
+
+@app.get("/pipeline/status")
+def pipeline_status():
+    """Return registered jobs + last-run state + scheduler info."""
+    try:
+        from mlops import runner as _runner
+        return _runner.status()
+    except Exception as e:
+        return {"error": str(e), "jobs": {}, "scheduler_running": False}
+
+
+@app.post("/pipeline/run")
+def pipeline_run(req: PipelineRunRequest):
+    """Trigger one job (req.job) or all of them. Returns metrics."""
+    try:
+        from mlops import runner as _runner
+    except Exception as e:
+        raise HTTPException(503, f"MLOps not available: {e}")
+    if req.job:
+        return {"job": req.job, "result": _runner.run_one(req.job)}
+    return {"results": _runner.run_all()}
+
+
+@app.post("/pipeline/scheduler/start")
+def pipeline_scheduler_start(interval_s: int = Query(0, ge=0)):
+    """Start the periodic scheduler. Pass `interval_s` to override the period."""
+    try:
+        from mlops import runner as _runner
+        _runner.start_scheduler(interval_s if interval_s > 0 else None)
+        return {"started": True, "interval_s": _runner.status()["interval_s"]}
+    except Exception as e:
+        raise HTTPException(503, f"MLOps not available: {e}")
+
+
+@app.post("/pipeline/scheduler/stop")
+def pipeline_scheduler_stop():
+    try:
+        from mlops import runner as _runner
+        _runner.stop_scheduler()
+        return {"stopped": True}
+    except Exception as e:
+        raise HTTPException(503, f"MLOps not available: {e}")
 
 
 # ── Voice transcript store ──

@@ -46,9 +46,9 @@ if "theme" not in st.session_state:
     st.session_state["theme"] = "dark"
 
 THEME = """
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=IBM+Plex+Mono:wght@300;400;500;600&family=Inter:wght@300;400;500&display=swap" rel="stylesheet">
+<style>
+/* System font fallbacks — no external requests needed inside Docker */
+</style>
 
 <style>
 :root {
@@ -76,9 +76,9 @@ THEME = """
   --border: rgba(0,212,255,0.12);
   --border-bright: rgba(0,212,255,0.30);
   --r-sm: 8px; --r-md: 14px; --r-lg: 20px; --r-xl: 28px;
-  --font-display: 'Syne', sans-serif;
-  --font-mono:    'IBM Plex Mono', monospace;
-  --font-body:    'Inter', sans-serif;
+  --font-display: 'Syne', 'Segoe UI', system-ui, sans-serif;
+  --font-mono:    'IBM Plex Mono', 'Consolas', 'Courier New', monospace;
+  --font-body:    'Inter', 'Segoe UI', system-ui, sans-serif;
 }
 *, *::before, *::after { box-sizing: border-box; }
 html, body, .stApp, [data-testid="stAppViewContainer"] {
@@ -404,37 +404,80 @@ DATA_DIR = Path(os.getenv("QOSBUDDY_DATA_DIR", "./data"))
 
 @st.cache_data(show_spinner=False)
 def load_anomaly_df():
-    df = pd.read_csv(DATA_DIR / "anomaly_scores_ns3.xls")
-    df = df.drop(columns=[c for c in df.columns if c.endswith(".1")])
-    df["ae_error"] = df["ae_error"].fillna(0.0)
-    df["consensus_anomaly"] = ((df["if_anomaly"]==1) & (df["ae_anomaly"]==1)).astype(int)
+    """Load anomaly KPI data, preferring the newest merged v2 file.
+
+    Source priority:
+      1. anomaly_scores_v2.csv  — the team's current truth (16-20 UEs, both v1
+         columns like severity/if_anomaly/ae_error AND the v2 model scores).
+      2. anomaly_scores_ns3.xls — legacy 5-UE NS-3 export, kept only as a
+         last-resort fallback so the dashboard still loads on a fresh clone.
+    """
+    candidates = ["anomaly_scores_v2.csv", "anomaly_scores_ns3.xls"]
+    df = None
+    for fname in candidates:
+        path = DATA_DIR / fname
+        if not path.exists(): continue
+        try:
+            df = pd.read_csv(path)
+            break
+        except Exception:
+            continue
+    if df is None:
+        return pd.DataFrame()
+    # Drop the duplicate-column .1 suffixes pandas adds when CSVs have repeats.
+    df = df.drop(columns=[c for c in df.columns if c.endswith(".1")], errors="ignore")
+    if "ae_error" in df.columns:
+        df["ae_error"] = pd.to_numeric(df["ae_error"], errors="coerce").fillna(0.0)
+    if "if_anomaly" in df.columns and "ae_anomaly" in df.columns:
+        df["consensus_anomaly"] = (
+            (pd.to_numeric(df["if_anomaly"], errors="coerce").fillna(0) == 1) &
+            (pd.to_numeric(df["ae_anomaly"], errors="coerce").fillna(0) == 1)
+        ).astype(int)
     return df
 
-@st.cache_data(show_spinner=False)
-def load_causal_df():
-    return pd.read_csv(DATA_DIR / "root_cause_labels.csv")
+def _load_static_plus_live(static_name: str, live_name: str = None) -> pd.DataFrame:
+    """Concat the static CSV with its `*_live.csv` MLOps output when both
+    exist. Static missing → return live alone. Live missing → return static."""
+    live_name = live_name or static_name.replace(".csv", "_live.csv")
+    static_p, live_p = DATA_DIR / static_name, DATA_DIR / live_name
+    parts = []
+    if static_p.exists():
+        try: parts.append(pd.read_csv(static_p))
+        except Exception: pass
+    if live_p.exists():
+        try:
+            live = pd.read_csv(live_p)
+            if not live.empty:
+                parts.append(live)
+        except Exception: pass
+    if not parts:
+        return pd.DataFrame()
+    if len(parts) == 1:
+        return parts[0]
+    return pd.concat(parts, ignore_index=True, sort=False)
 
-@st.cache_data(show_spinner=False)
+
+@st.cache_data(show_spinner=False, ttl=8)
+def load_causal_df():
+    return _load_static_plus_live("root_cause_labels.csv")
+
+@st.cache_data(show_spinner=False, ttl=8)
 def load_cf_df():
-    df = pd.read_csv(DATA_DIR / "counterfactuals.csv")
+    df = _load_static_plus_live("counterfactuals.csv")
+    if df.empty:
+        return df
     if "timestamp" in df.columns:
         df = df[df["timestamp"] != "timestamp"].reset_index(drop=True)
         df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce").fillna(1).astype(int)
     return df
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=8)
 def load_sla_df():
-    try:
-        return pd.read_csv(DATA_DIR / "sla_breach_predictions.csv")
-    except FileNotFoundError:
-        return pd.DataFrame()
+    return _load_static_plus_live("sla_breach_predictions.csv")
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=8)
 def load_severity_df():
-    try:
-        return pd.read_csv(DATA_DIR / "severity_triage.csv")
-    except FileNotFoundError:
-        return pd.DataFrame()
+    return _load_static_plus_live("severity_triage.csv")
 
 @st.cache_data(show_spinner=False)
 def load_bench_df():
@@ -449,6 +492,126 @@ def load_rl_df():
         return pd.read_csv(DATA_DIR / "rl_vs_baseline_comparison.csv")
     except FileNotFoundError:
         return pd.DataFrame()
+
+# ── Live-data promotion ──────────────────────────────────────────────────
+# When the bridge has streamed at least this many rows, the dashboard switches
+# from static CSVs to the live feed for cross-page analytics. Override via env.
+LIVE_PROMOTE_THRESHOLD = int(os.getenv("QOSBUDDY_LIVE_THRESHOLD", "200"))
+
+
+def _fetch_live_status():
+    """Quick health check on the live buffer; returns (total_rows, connected)."""
+    s, err = _rl_api_get("/live/status", timeout=4.0) if False else (None, None)
+    # Avoid a circular dep at import time — use urllib directly.
+    import urllib.request as _ur, json as _js
+    try:
+        with _ur.urlopen(f"{RL_API_URL}/live/status", timeout=3.0) as r:
+            d = _js.loads(r.read().decode("utf-8"))
+            return int(d.get("total_received", 0) or 0), bool(d.get("bridge_connected"))
+    except Exception:
+        return 0, False
+
+
+def _project_live_to_v1_schema(df: pd.DataFrame) -> pd.DataFrame:
+    """Project bridge live rows into the v1 anomaly_df schema.
+
+    The bridge sends raw KPIs plus `_live_anomaly` and `_live_scores`. We add
+    the columns the rest of the dashboard expects: if_anomaly, ae_anomaly,
+    consensus_anomaly, if_score, severity.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df = df.copy()
+    if "_live_anomaly" in df.columns:
+        df["if_anomaly"] = pd.to_numeric(df["_live_anomaly"], errors="coerce").fillna(0).astype(int)
+        df["ae_anomaly"] = df["if_anomaly"]
+        df["consensus_anomaly"] = df["if_anomaly"]
+    if "_live_scores" in df.columns:
+        sdf = pd.json_normalize(df["_live_scores"].apply(lambda x: x if isinstance(x, dict) else {}))
+        if "isolation_forest" in sdf.columns and "if_score" not in df.columns:
+            df["if_score"] = pd.to_numeric(sdf["isolation_forest"], errors="coerce")
+    if "severity" not in df.columns and "packet_loss_ratio" in df.columns:
+        ploss = pd.to_numeric(df["packet_loss_ratio"], errors="coerce").fillna(0)
+        flag  = df.get("if_anomaly", pd.Series([0]*len(df)))
+        sev = []
+        for f, p in zip(flag, ploss):
+            if f == 1 and p > 0.5: sev.append("critical")
+            elif f == 1 or p > 0.2: sev.append("degraded")
+            else: sev.append("normal")
+        df["severity"] = sev
+    return df
+
+
+@st.cache_data(show_spinner=False, ttl=4)
+def _fetch_live_log_df(last_n: int = 5000) -> pd.DataFrame:
+    """Read the persistent JSONL log via /live/log. Falls back to /live/stream."""
+    import urllib.request as _ur, json as _js
+    # Primary path: persistent log (full cumulative history).
+    try:
+        with _ur.urlopen(f"{RL_API_URL}/live/log?last_n={int(last_n)}", timeout=8.0) as r:
+            payload = _js.loads(r.read().decode("utf-8"))
+        rows = payload.get("data") or []
+        if rows:
+            return _project_live_to_v1_schema(pd.DataFrame(rows))
+    except Exception:
+        pass
+    # Fallback: in-memory buffer (last 500 rows only).
+    try:
+        with _ur.urlopen(f"{RL_API_URL}/live/stream?last_n=500", timeout=5.0) as r:
+            payload = _js.loads(r.read().decode("utf-8"))
+        rows = payload.get("data") or []
+        if rows:
+            return _project_live_to_v1_schema(pd.DataFrame(rows))
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+
+def get_active_anomaly_df(static_df):
+    """Return static CSV augmented with the persistent live log when threshold crossed.
+
+    MLOps pattern: the static historical dataset is the **base**, and live rows
+    accumulate on top via the JSONL log. Once the cumulative live count crosses
+    LIVE_PROMOTE_THRESHOLD, every page that consumes anomaly_df sees both
+    historical + streamed observations concatenated.
+
+    Sets st.session_state['_data_source'] for the sidebar indicator.
+    """
+    total_rx, _ = _fetch_live_status()
+    static_n = 0 if (static_df is None) else len(static_df)
+    if total_rx >= LIVE_PROMOTE_THRESHOLD:
+        live_df = _fetch_live_log_df(last_n=5000)
+        live_n  = len(live_df)
+        if live_n > 0:
+            if static_df is None or static_df.empty:
+                st.session_state["_data_source"] = ("augmented", total_rx, 0, live_n)
+                return live_df
+            # Align columns — keep union, fill missing with NaN.
+            combined = pd.concat([static_df, live_df], ignore_index=True, sort=False)
+            st.session_state["_data_source"] = ("augmented", total_rx, static_n, live_n)
+            return combined
+    st.session_state["_data_source"] = ("static", total_rx, static_n, 0)
+    return static_df
+
+
+# ── Schema-defensive helpers ─────────────────────────────────────────────
+def _col(df, *candidates, default=None):
+    """Return the first candidate column that exists in df, or default."""
+    if df is None or len(df) == 0:
+        return default
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return default
+
+def _empty_state(title: str, hint: str = ""):
+    """Render a friendly empty-state panel instead of crashing or blank chart."""
+    st.markdown(
+        f"""<div class="glass-panel" style="text-align:center;padding:36px 20px;">
+        <div style="font-family:var(--font-mono);font-size:11px;color:var(--text-3);
+             text-transform:uppercase;letter-spacing:0.18em;margin-bottom:8px;">{title}</div>
+        <div style="font-size:13px;color:var(--text-2);">{hint or 'No data available for this view.'}</div>
+        </div>""", unsafe_allow_html=True)
 
 # ── RL Agent API helpers (DSO3.1 live inference) ──
 RL_API_URL = os.getenv("QOSBUDDY_API_URL", "http://localhost:8000")
@@ -514,6 +677,7 @@ NAV_ITEMS = [
     ("severity",  "🎯", "Severity Triage"),
     ("benchmark", "📈", "Benchmarking"),
     ("rl",        "🤖", "RL Actions"),
+    ("live_monitor", "📡", "Live Monitor"),
     ("chat",      "💬", "Ask the Network"),
     ("voice",     "&#127897;", "Voice NOC Assistant"),
     ("export",    "📄", "Export Report"),
@@ -538,12 +702,18 @@ def render_sidebar():
         </div>
         """, unsafe_allow_html=True)
 
+        # Page persistence: restore from ?page=… on refresh, sync URL on nav.
+        _valid_pages = {k for k, _, _ in NAV_ITEMS}
         if "page" not in st.session_state:
-            st.session_state["page"] = "voice"
+            url_page = st.query_params.get("page")
+            st.session_state["page"] = url_page if url_page in _valid_pages else "voice"
+        if st.query_params.get("page") != st.session_state["page"]:
+            st.query_params["page"] = st.session_state["page"]
 
         for key, icon, label in NAV_ITEMS:
             if st.button(f"{icon}  {label}", key=f"nav_{key}", width='stretch'):
                 st.session_state["page"] = key
+                st.query_params["page"] = key
                 st.rerun()
 
         st.markdown("""<div style="height:1px;background:rgba(0,212,255,0.1);margin:12px 16px;"></div>""", unsafe_allow_html=True)
@@ -560,11 +730,91 @@ def render_sidebar():
 
         sev = st.selectbox("Severity", ["All","critical","degraded","normal"],
                            key="sev_sel", label_visibility="collapsed")
-        ue  = st.selectbox("UE", ["All"]+[str(i) for i in range(1,11)],
+        # Data-driven UE list — covers Eya's 20-UE dataset and falls back to
+        # 1..20 when the data hasn't loaded yet.
+        ue_choices = st.session_state.get("_ue_choices") or list(range(1, 21))
+        ue  = st.selectbox("UE", ["All"] + [str(i) for i in ue_choices],
                            key="ue_sel", label_visibility="collapsed")
         st.session_state["sev_f"] = None if sev=="All" else sev
         st.session_state["ue_f"]  = None if ue=="All"  else int(ue)
         st.markdown("</div>", unsafe_allow_html=True)
+
+        # Data-source indicator (augmented = static + live; static otherwise)
+        ds = st.session_state.get("_data_source")
+        if ds:
+            kind = ds[0]
+            total = ds[1] if len(ds) > 1 else 0
+            if kind == "augmented":
+                static_n = ds[2] if len(ds) > 2 else 0
+                live_n   = ds[3] if len(ds) > 3 else 0
+                st.markdown(
+                    f"""<div style="margin:8px 16px;padding:8px 12px;border-radius:8px;
+                         background:rgba(0,229,160,0.08);border:1px solid rgba(0,229,160,0.3);
+                         font-family:'IBM Plex Mono';font-size:9px;letter-spacing:0.12em;
+                         text-transform:uppercase;color:var(--emerald);">
+                      <span style="display:inline-block;width:6px;height:6px;border-radius:50%;
+                            background:var(--emerald);box-shadow:0 0 6px var(--emerald);
+                            margin-right:6px;"></span>
+                      AUGMENTED · {static_n:,} static + {live_n:,} live<br>
+                      <span style="color:var(--text-3);font-size:8px;letter-spacing:0.18em;">
+                        {total:,} rows received total
+                      </span>
+                    </div>""", unsafe_allow_html=True)
+            else:
+                st.markdown(
+                    f"""<div style="margin:8px 16px;padding:8px 12px;border-radius:8px;
+                         background:rgba(0,212,255,0.05);border:1px solid rgba(0,212,255,0.15);
+                         font-family:'IBM Plex Mono';font-size:9px;letter-spacing:0.12em;
+                         text-transform:uppercase;color:var(--text-3);">
+                      STATIC CSV · {total:,} live (need {LIVE_PROMOTE_THRESHOLD})
+                    </div>""", unsafe_allow_html=True)
+
+        # ── MLOps panel: pipeline status + manual trigger ──
+        with st.expander("🔧 MLOps Pipeline", expanded=False):
+            pl_status, pl_err = _rl_api_get("/pipeline/status", timeout=3.0)
+            if pl_err or not pl_status:
+                st.caption(f"Pipeline status unavailable: {pl_err}")
+            else:
+                interval = pl_status.get("interval_s", 300)
+                running  = pl_status.get("scheduler_running", False)
+                jobs     = pl_status.get("jobs", {}) or {}
+                st.markdown(
+                    f"<div style='font-family:IBM Plex Mono;font-size:10px;color:var(--text-3);"
+                    f"text-transform:uppercase;letter-spacing:0.12em;margin-bottom:6px;'>"
+                    f"{'🟢 ACTIVE' if running else '⏸ PAUSED'} · every {interval}s"
+                    f"</div>", unsafe_allow_html=True)
+                # Per-job tiny rows
+                STATUS_COLOR = {"ok":"var(--emerald)","fail":"var(--rose)",
+                                "running":"var(--amber)","never":"var(--text-3)"}
+                for jname, jrec in jobs.items():
+                    s = jrec.get("last_status","never")
+                    last = jrec.get("last_run") or "never"
+                    last_disp = last[-8:] if last and last != "never" else "—"
+                    runs = jrec.get("runs", 0)
+                    err  = jrec.get("last_error") or ""
+                    color = STATUS_COLOR.get(s, "var(--text-3)")
+                    st.markdown(
+                        f"<div style='display:flex;justify-content:space-between;"
+                        f"font-family:IBM Plex Mono;font-size:9px;padding:2px 0;'>"
+                        f"<span><span style='color:{color};'>●</span> "
+                        f"{jname}</span>"
+                        f"<span style='color:var(--text-3);'>{last_disp} · {runs}x</span>"
+                        f"</div>", unsafe_allow_html=True)
+                    if err and s == "fail":
+                        st.caption(f"  ⚠ {err[:90]}")
+                # Trigger buttons
+                bc1, bc2 = st.columns(2)
+                if bc1.button("▶ Run all", key="_ml_run_all", width='stretch'):
+                    with st.spinner("Running all jobs…"):
+                        _, e = _rl_api_post("/pipeline/run", {}, timeout=120.0)
+                    if e: st.error(e)
+                    else: st.cache_data.clear(); st.rerun()
+                tog_label = "⏸ Pause" if running else "▶ Start"
+                if bc2.button(tog_label, key="_ml_toggle", width='stretch'):
+                    path = "/pipeline/scheduler/stop" if running else "/pipeline/scheduler/start"
+                    _, e = _rl_api_post(path, {}, timeout=8.0)
+                    if e: st.error(e)
+                    else: st.rerun()
 
         st.markdown(f"""
         <div style="padding:10px 16px;font-family:'IBM Plex Mono';font-size:9px;
@@ -587,6 +837,7 @@ _COMPANION_LABELS = {
     "severity":  "Severity Triage",
     "benchmark": "Benchmarking",
     "rl":        "RL Actions",
+    "live_monitor": "Live Monitor",
     "chat":      "Ask the Network",
     "voice":     "Voice NOC",
     "export":    "Export Report",
@@ -1199,89 +1450,137 @@ def kpi_card(label, value, unit, status, pct=50, status_text=""):
 
 def page_kpi_overview(anomaly_df, causal_df):
     page_header("📊","Network KPI Overview","DSO1.1 · DSO2.2 · Real-time Quality of Service Intelligence")
+    if anomaly_df is None or len(anomaly_df) == 0:
+        _empty_state("KPI OVERVIEW", "Anomaly data file not found. Check QOSBUDDY_DATA_DIR.")
+        return
     df = apply_filters(anomaly_df)
 
-    avg_jitter     = df["jitter_ms"].mean()
-    avg_pkt_loss   = df["packet_loss_ratio"].mean() * 100
-    avg_throughput = df["throughput_mbps"].mean()
-    avg_delay      = df["delay_ms"].mean()
-    anomaly_rate   = df["if_anomaly"].mean() * 100
-    sinr_mean      = df["sinr_dl_db"].mean()
+    def _safe_mean(col, scale=1.0):
+        if col not in df.columns: return None
+        v = pd.to_numeric(df[col], errors="coerce").mean()
+        return None if pd.isna(v) else v * scale
+
+    avg_jitter     = _safe_mean("jitter_ms")
+    avg_pkt_loss   = _safe_mean("packet_loss_ratio", 100)
+    avg_throughput = _safe_mean("throughput_mbps")
+    avg_delay      = _safe_mean("delay_ms")
+    anomaly_rate   = _safe_mean("if_anomaly", 100)
+    sinr_mean      = _safe_mean("sinr_dl_db")
 
     cols = st.columns(6)
     with cols[0]:
-        s = "ok" if avg_jitter<10 else "warn" if avg_jitter<50 else "crit"
-        kpi_card("Avg Jitter", f"{avg_jitter:.1f}", "ms", s, min(avg_jitter,100),
-                 "▲ ELEVATED" if s=="warn" else ("🔴 CRITICAL" if s=="crit" else "✓ NOMINAL"))
+        if avg_jitter is None:
+            kpi_card("Avg Jitter", "—", "ms", "ok", 0, "no data")
+        else:
+            s = "ok" if avg_jitter<10 else "warn" if avg_jitter<50 else "crit"
+            kpi_card("Avg Jitter", f"{avg_jitter:.1f}", "ms", s, min(avg_jitter,100),
+                     "▲ ELEVATED" if s=="warn" else ("🔴 CRITICAL" if s=="crit" else "✓ NOMINAL"))
     with cols[1]:
-        s = "ok" if avg_pkt_loss<10 else "warn" if avg_pkt_loss<40 else "crit"
-        kpi_card("Packet Loss", f"{avg_pkt_loss:.1f}", "%", s, avg_pkt_loss,
-                 "🔴 HIGH LOSS" if s=="crit" else ("⚠ MODERATE" if s=="warn" else "✓ NOMINAL"))
+        if avg_pkt_loss is None:
+            kpi_card("Packet Loss", "—", "%", "ok", 0, "no data")
+        else:
+            s = "ok" if avg_pkt_loss<10 else "warn" if avg_pkt_loss<40 else "crit"
+            kpi_card("Packet Loss", f"{avg_pkt_loss:.1f}", "%", s, avg_pkt_loss,
+                     "🔴 HIGH LOSS" if s=="crit" else ("⚠ MODERATE" if s=="warn" else "✓ NOMINAL"))
     with cols[2]:
-        s = "ok" if avg_throughput>2 else "warn" if avg_throughput>0.5 else "crit"
-        kpi_card("Throughput", f"{avg_throughput:.2f}", "Mbps", s, min(avg_throughput/10*100,100),
-                 "🔴 DEGRADED" if s=="crit" else ("⚠ LOW" if s=="warn" else "✓ NOMINAL"))
+        if avg_throughput is None:
+            kpi_card("Throughput", "—", "Mbps", "ok", 0, "no data")
+        else:
+            s = "ok" if avg_throughput>2 else "warn" if avg_throughput>0.5 else "crit"
+            kpi_card("Throughput", f"{avg_throughput:.2f}", "Mbps", s, min(avg_throughput/10*100,100),
+                     "🔴 DEGRADED" if s=="crit" else ("⚠ LOW" if s=="warn" else "✓ NOMINAL"))
     with cols[3]:
-        s = "ok" if avg_delay<50 else "warn" if avg_delay<200 else "crit"
-        kpi_card("Avg Delay", f"{avg_delay:.0f}", "ms", s, min(avg_delay/500*100,100),
-                 "🔴 HIGH RTT" if s=="crit" else ("⚠ ELEVATED" if s=="warn" else "✓ NOMINAL"))
+        if avg_delay is None:
+            kpi_card("Avg Delay", "—", "ms", "ok", 0, "no data")
+        else:
+            s = "ok" if avg_delay<50 else "warn" if avg_delay<200 else "crit"
+            kpi_card("Avg Delay", f"{avg_delay:.0f}", "ms", s, min(avg_delay/500*100,100),
+                     "🔴 HIGH RTT" if s=="crit" else ("⚠ ELEVATED" if s=="warn" else "✓ NOMINAL"))
     with cols[4]:
-        s = "ok" if anomaly_rate<20 else "warn" if anomaly_rate<45 else "crit"
-        kpi_card("Anomaly Rate", f"{anomaly_rate:.1f}", "%", s, anomaly_rate,
-                 "🔴 CRISIS" if s=="crit" else ("⚠ WATCHLIST" if s=="warn" else "✓ STABLE"))
+        if anomaly_rate is None:
+            kpi_card("Anomaly Rate", "—", "%", "ok", 0, "no data")
+        else:
+            s = "ok" if anomaly_rate<20 else "warn" if anomaly_rate<45 else "crit"
+            kpi_card("Anomaly Rate", f"{anomaly_rate:.1f}", "%", s, anomaly_rate,
+                     "🔴 CRISIS" if s=="crit" else ("⚠ WATCHLIST" if s=="warn" else "✓ STABLE"))
     with cols[5]:
-        s = "ok" if sinr_mean>5 else "warn" if sinr_mean>-5 else "crit"
-        kpi_card("Avg SINR", f"{sinr_mean:.1f}", "dB", s, min((sinr_mean+30)/60*100,100),
-                 "🔴 POOR RF" if s=="crit" else ("⚠ MARGINAL" if s=="warn" else "✓ NOMINAL"))
+        if sinr_mean is None:
+            kpi_card("Avg SINR", "—", "dB", "ok", 0, "no data")
+        else:
+            s = "ok" if sinr_mean>5 else "warn" if sinr_mean>-5 else "crit"
+            kpi_card("Avg SINR", f"{sinr_mean:.1f}", "dB", s, min((sinr_mean+30)/60*100,100),
+                     "🔴 POOR RF" if s=="crit" else ("⚠ MARGINAL" if s=="warn" else "✓ NOMINAL"))
 
     st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
     col_l, col_m, col_r = st.columns([1,1,2])
 
     with col_l:
         st.markdown('<div class="glass-panel"><div class="glass-panel-title">Severity Distribution</div>', unsafe_allow_html=True)
-        sev_counts = df["severity"].value_counts().reset_index()
-        sev_counts.columns = ["severity","count"]
-        fig = go.Figure(go.Pie(
-            labels=sev_counts["severity"], values=sev_counts["count"], hole=0.68,
-            marker=dict(colors=[COLORS.get(s,"#888") for s in sev_counts["severity"]],
-                        line=dict(color="#080c12", width=3)),
-            textinfo="none",
-            hovertemplate="<b>%{label}</b><br>%{value:,} events<br>%{percent}<extra></extra>",
-        ))
-        total = len(df)
-        fig.add_annotation(text=f"<b>{total:,}</b>", x=0.5, y=0.55,
-                           font=dict(size=22,color="#e8f0fe",family="Syne"), showarrow=False)
-        fig.add_annotation(text="EVENTS", x=0.5, y=0.38,
-                           font=dict(size=9,color="#4a5568",family="IBM Plex Mono"), showarrow=False)
-        fig.update_layout(**PLOT_LAYOUT, showlegend=True,
-                          legend=dict(orientation="h",yanchor="bottom",y=-0.15,xanchor="center",x=0.5),
-                          height=260, margin=dict(t=10,b=40,l=10,r=10))
-        st.plotly_chart(fig, width='stretch')
+        if "severity" in df.columns:
+            sev_counts = df["severity"].value_counts().reset_index()
+            sev_counts.columns = ["severity","count"]
+            fig = go.Figure(go.Pie(
+                labels=sev_counts["severity"], values=sev_counts["count"], hole=0.68,
+                marker=dict(colors=[COLORS.get(s,"#888") for s in sev_counts["severity"]],
+                            line=dict(color="#080c12", width=3)),
+                textinfo="none",
+                hovertemplate="<b>%{label}</b><br>%{value:,} events<br>%{percent}<extra></extra>",
+            ))
+            total = len(df)
+            fig.add_annotation(text=f"<b>{total:,}</b>", x=0.5, y=0.55,
+                               font=dict(size=22,color="#e8f0fe",family="Syne"), showarrow=False)
+            fig.add_annotation(text="EVENTS", x=0.5, y=0.38,
+                               font=dict(size=9,color="#4a5568",family="IBM Plex Mono"), showarrow=False)
+            fig.update_layout(**PLOT_LAYOUT, showlegend=True,
+                              legend=dict(orientation="h",yanchor="bottom",y=-0.15,xanchor="center",x=0.5),
+                              height=260, margin=dict(t=10,b=40,l=10,r=10))
+            st.plotly_chart(fig, width='stretch')
+        else:
+            st.markdown("<div style='padding:30px;text-align:center;color:var(--text-3);font-size:11px;'>severity column not in this dataset</div>", unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
     with col_m:
         st.markdown('<div class="glass-panel"><div class="glass-panel-title">Root Cause Breakdown</div>', unsafe_allow_html=True)
-        rc_df = causal_df.copy()
-        if st.session_state.get("sev_f"):
-            rc_df = rc_df[rc_df["severity"]==st.session_state["sev_f"]]
-        rc = rc_df["root_cause"].value_counts().reset_index()
-        rc.columns = ["root_cause","count"]
-        rc = rc.sort_values("count")
-        fig = go.Figure(go.Bar(
-            x=rc["count"], y=rc["root_cause"], orientation="h",
-            marker=dict(color=rc["count"],
-                        colorscale=[[0,"rgba(0,212,255,0.2)"],[1,"#00d4ff"]],
-                        line=dict(color="rgba(0,212,255,0.3)",width=1)),
-            hovertemplate="<b>%{y}</b><br>%{x:,} events<extra></extra>",
-        ))
-        fig.update_layout(**PLOT_LAYOUT, height=260, margin=dict(t=10,b=10,l=10,r=10))
-        st.plotly_chart(fig, width='stretch')
+        if causal_df is None or len(causal_df) == 0 or "root_cause" not in causal_df.columns:
+            st.markdown("<div style='padding:30px;text-align:center;color:var(--text-3);font-size:11px;'>no causal labels available</div>", unsafe_allow_html=True)
+        else:
+            rc_df = causal_df.copy()
+            if st.session_state.get("sev_f") and "severity" in rc_df.columns:
+                rc_df = rc_df[rc_df["severity"]==st.session_state["sev_f"]]
+            rc = rc_df["root_cause"].value_counts().reset_index()
+            rc.columns = ["root_cause","count"]
+            rc = rc.sort_values("count")
+            if rc.empty:
+                st.markdown("<div style='padding:30px;text-align:center;color:var(--text-3);font-size:11px;'>no events match filter</div>", unsafe_allow_html=True)
+            else:
+                fig = go.Figure(go.Bar(
+                    x=rc["count"], y=rc["root_cause"], orientation="h",
+                    marker=dict(color=rc["count"],
+                                colorscale=[[0,"rgba(0,212,255,0.2)"],[1,"#00d4ff"]],
+                                line=dict(color="rgba(0,212,255,0.3)",width=1)),
+                    hovertemplate="<b>%{y}</b><br>%{x:,} events<extra></extra>",
+                ))
+                fig.update_layout(**PLOT_LAYOUT, height=260, margin=dict(t=10,b=10,l=10,r=10))
+                st.plotly_chart(fig, width='stretch')
         st.markdown("</div>", unsafe_allow_html=True)
 
     with col_r:
-        st.markdown('<div class="glass-panel"><div class="glass-panel-title">Packet Loss Timeline — UEs 1–8</div>', unsafe_allow_html=True)
+        # Pick the 8 UEs with the most rows so we adapt to whatever dataset is
+        # loaded (5-UE NS-3 anomaly file, 10-UE original, 20-UE LENA, etc.).
+        if "ue_id" in df.columns:
+            top_ues = df["ue_id"].value_counts().head(8).index.tolist()
+            top_ues = sorted(top_ues)
+            # Stash the full UE list for the sidebar filter
+            try:
+                st.session_state["_ue_choices"] = sorted(df["ue_id"].dropna().unique().astype(int).tolist())
+            except Exception:
+                pass
+            label_range = f"{int(min(top_ues))}–{int(max(top_ues))}" if top_ues else "n/a"
+        else:
+            top_ues, label_range = [], "n/a"
+        st.markdown(f'<div class="glass-panel"><div class="glass-panel-title">Packet Loss Timeline — Top 8 UEs ({label_range})</div>', unsafe_allow_html=True)
         if "ue_id" in df.columns and "timestamp" in df.columns:
-            df_ts = df[df["ue_id"].isin(range(1,9))].sort_values(["ue_id","timestamp"])
+            df_ts = df[df["ue_id"].isin(top_ues)].sort_values(["ue_id","timestamp"])
             x_col = "timestamp"
         elif "window_idx" in df.columns:
             df_ts = df.copy()
@@ -1313,36 +1612,46 @@ def page_kpi_overview(anomaly_df, causal_df):
     col_a, col_b = st.columns(2)
     with col_a:
         st.markdown('<div class="glass-panel"><div class="glass-panel-title">SINR Distribution by Load Level</div>', unsafe_allow_html=True)
-        fig = go.Figure()
-        for i, ll in enumerate(sorted(df["load_level"].unique())):
-            d = df[df["load_level"]==ll]["sinr_dl_db"]
-            c = COLORS["seq"][i%len(COLORS["seq"])]
-            fig.add_trace(go.Box(y=d, name=f"Load {ll}", marker_color=c,
-                                 line_color=c, fillcolor=hex_to_rgba(c,0.13), boxmean="sd"))
-        fig.update_layout(**PLOT_LAYOUT, height=280, showlegend=False,
-                          margin=dict(t=10,b=10,l=10,r=10), yaxis_title="SINR (dB)")
-        st.plotly_chart(fig, width='stretch')
+        if "load_level" in df.columns and "sinr_dl_db" in df.columns:
+            fig = go.Figure()
+            for i, ll in enumerate(sorted(df["load_level"].dropna().unique())):
+                d = pd.to_numeric(df[df["load_level"]==ll]["sinr_dl_db"], errors="coerce").dropna()
+                if d.empty: continue
+                c = COLORS["seq"][i%len(COLORS["seq"])]
+                fig.add_trace(go.Box(y=d, name=f"Load {ll}", marker_color=c,
+                                     line_color=c, fillcolor=hex_to_rgba(c,0.13), boxmean="sd"))
+            if fig.data:
+                fig.update_layout(**PLOT_LAYOUT, height=280, showlegend=False,
+                                  margin=dict(t=10,b=10,l=10,r=10), yaxis_title="SINR (dB)")
+                st.plotly_chart(fig, width='stretch')
+            else:
+                st.markdown("<div style='padding:30px;text-align:center;color:var(--text-3);font-size:11px;'>no SINR data</div>", unsafe_allow_html=True)
+        else:
+            st.markdown("<div style='padding:30px;text-align:center;color:var(--text-3);font-size:11px;'>load_level / sinr_dl_db not in dataset</div>", unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
     with col_b:
         st.markdown('<div class="glass-panel"><div class="glass-panel-title">Detector Agreement Matrix</div>', unsafe_allow_html=True)
-        both    = int(((df["if_anomaly"]==1) & (df["ae_anomaly"]==1)).sum())
-        if_only = int(((df["if_anomaly"]==1) & (df["ae_anomaly"]==0)).sum())
-        ae_only = int(((df["if_anomaly"]==0) & (df["ae_anomaly"]==1)).sum())
-        neither = int(((df["if_anomaly"]==0) & (df["ae_anomaly"]==0)).sum())
-        labels  = ["Both Agree","IF Only","AE Only","Neither"]
-        vals    = [both,if_only,ae_only,neither]
-        bar_colors = [COLORS["critical"],COLORS["degraded"],COLORS["violet"],COLORS["normal"]]
-        fig = go.Figure(go.Bar(
-            x=labels, y=vals,
-            marker=dict(color=[hex_to_rgba(c,0.67) for c in bar_colors], line=dict(color=bar_colors,width=2)),
-            text=[f"{v:,}" for v in vals], textposition="auto",
-            textfont=dict(family="IBM Plex Mono", size=11),
-            hovertemplate="<b>%{x}</b><br>%{y:,} events<extra></extra>",
-        ))
-        fig.update_layout(**PLOT_LAYOUT, height=280, showlegend=False,
-                          margin=dict(t=10,b=10,l=10,r=10), yaxis_title="Events")
-        st.plotly_chart(fig, width='stretch')
+        if "if_anomaly" in df.columns and "ae_anomaly" in df.columns:
+            both    = int(((df["if_anomaly"]==1) & (df["ae_anomaly"]==1)).sum())
+            if_only = int(((df["if_anomaly"]==1) & (df["ae_anomaly"]==0)).sum())
+            ae_only = int(((df["if_anomaly"]==0) & (df["ae_anomaly"]==1)).sum())
+            neither = int(((df["if_anomaly"]==0) & (df["ae_anomaly"]==0)).sum())
+            labels  = ["Both Agree","IF Only","AE Only","Neither"]
+            vals    = [both,if_only,ae_only,neither]
+            bar_colors = [COLORS["critical"],COLORS["degraded"],COLORS["violet"],COLORS["normal"]]
+            fig = go.Figure(go.Bar(
+                x=labels, y=vals,
+                marker=dict(color=[hex_to_rgba(c,0.67) for c in bar_colors], line=dict(color=bar_colors,width=2)),
+                text=[f"{v:,}" for v in vals], textposition="auto",
+                textfont=dict(family="IBM Plex Mono", size=11),
+                hovertemplate="<b>%{x}</b><br>%{y:,} events<extra></extra>",
+            ))
+            fig.update_layout(**PLOT_LAYOUT, height=280, showlegend=False,
+                              margin=dict(t=10,b=10,l=10,r=10), yaxis_title="Events")
+            st.plotly_chart(fig, width='stretch')
+        else:
+            st.markdown("<div style='padding:30px;text-align:center;color:var(--text-3);font-size:11px;'>detector columns (if_anomaly/ae_anomaly) not in dataset</div>", unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
 
@@ -1352,11 +1661,15 @@ def page_kpi_overview(anomaly_df, causal_df):
 
 def page_anomaly_feed(anomaly_df):
     page_header("🚨","Anomaly Feed","DSO2.2 · DSO2.3 · Isolation Forest + LSTM Autoencoder Triage Board")
+    if anomaly_df is None or len(anomaly_df) == 0:
+        _empty_state("ANOMALY FEED", "Anomaly data file not found.")
+        return
     df = apply_filters(anomaly_df)
 
-    n_crit = int((df["severity"]=="critical").sum())
-    n_degr = int((df["severity"]=="degraded").sum())
-    n_norm = int((df["severity"]=="normal").sum())
+    n_crit = int((df["severity"]=="critical").sum()) if "severity" in df.columns else 0
+    n_degr = int((df["severity"]=="degraded").sum()) if "severity" in df.columns else 0
+    n_norm = int((df["severity"]=="normal").sum())   if "severity" in df.columns else 0
+    n_cons = int(df["consensus_anomaly"].sum())      if "consensus_anomaly" in df.columns else 0
 
     st.markdown(f"""
     <div class="stat-row">
@@ -1364,40 +1677,55 @@ def page_anomaly_feed(anomaly_df):
       <div class="stat-chip crit"><span class="stat-chip-label">Critical</span><span class="stat-chip-value">{n_crit:,}</span></div>
       <div class="stat-chip warn"><span class="stat-chip-label">Degraded</span><span class="stat-chip-value">{n_degr:,}</span></div>
       <div class="stat-chip ok"><span class="stat-chip-label">Normal</span><span class="stat-chip-value">{n_norm:,}</span></div>
-      <div class="stat-chip total"><span class="stat-chip-label">Consensus</span><span class="stat-chip-value">{df['consensus_anomaly'].sum():,}</span></div>
+      <div class="stat-chip total"><span class="stat-chip-label">Consensus</span><span class="stat-chip-value">{n_cons:,}</span></div>
     </div>""", unsafe_allow_html=True)
 
     col_l, col_r = st.columns([3,2])
     with col_l:
         st.markdown('<div class="glass-panel"><div class="glass-panel-title">IF Score vs AE Reconstruction Error</div>', unsafe_allow_html=True)
-        sample = df.sample(min(3000,len(df)), random_state=42)
-        fig = go.Figure()
-        for sev, col in [("critical",COLORS["critical"]),("degraded",COLORS["degraded"]),("normal",COLORS["normal"])]:
-            d = sample[sample["severity"]==sev]
-            fig.add_trace(go.Scatter(x=d["if_score"], y=d["ae_error"], name=sev.capitalize(), mode="markers",
-                                     marker=dict(color=hex_to_rgba(col,0.6), size=4, line=dict(color=col,width=0.5)),
-                                     hovertemplate=f"<b>{sev}</b><br>IF=%{{x:.4f}}<br>AE=%{{y:.4f}}<extra></extra>"))
-        fig.update_layout(**PLOT_LAYOUT, height=300, xaxis_title="IF Anomaly Score",
-                          yaxis_title="AE Reconstruction Error", margin=dict(t=10,b=10,l=10,r=10))
-        st.plotly_chart(fig, width='stretch')
+        if {"if_score","ae_error","severity"}.issubset(df.columns) and len(df) > 0:
+            sample = df.sample(min(3000,len(df)), random_state=42)
+            fig = go.Figure()
+            for sev, col in [("critical",COLORS["critical"]),("degraded",COLORS["degraded"]),("normal",COLORS["normal"])]:
+                d = sample[sample["severity"]==sev]
+                if d.empty: continue
+                fig.add_trace(go.Scatter(x=d["if_score"], y=d["ae_error"], name=sev.capitalize(), mode="markers",
+                                         marker=dict(color=hex_to_rgba(col,0.6), size=4, line=dict(color=col,width=0.5)),
+                                         hovertemplate=f"<b>{sev}</b><br>IF=%{{x:.4f}}<br>AE=%{{y:.4f}}<extra></extra>"))
+            if fig.data:
+                fig.update_layout(**PLOT_LAYOUT, height=300, xaxis_title="IF Anomaly Score",
+                                  yaxis_title="AE Reconstruction Error", margin=dict(t=10,b=10,l=10,r=10))
+                st.plotly_chart(fig, width='stretch')
+            else:
+                st.markdown("<div style='padding:30px;text-align:center;color:var(--text-3);font-size:11px;'>no scored events</div>", unsafe_allow_html=True)
+        else:
+            st.markdown("<div style='padding:30px;text-align:center;color:var(--text-3);font-size:11px;'>if_score / ae_error / severity not in dataset (v2 schema?)</div>", unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
     with col_r:
         st.markdown('<div class="glass-panel"><div class="glass-panel-title">Consensus Heatmap — UE × Load Level</div>', unsafe_allow_html=True)
-        hm = anomaly_df.groupby(["ue_id","load_level"])["consensus_anomaly"].mean().reset_index()
-        pivot = hm.pivot(index="ue_id", columns="load_level", values="consensus_anomaly")
-        fig = go.Figure(go.Heatmap(
-            z=pivot.values, x=[f"Load {c}" for c in pivot.columns], y=[f"UE {r}" for r in pivot.index],
-            colorscale=[[0,"#0d1420"],[0.5,"rgba(255,77,109,0.27)"],[1,"#ff4d6d"]],
-            hovertemplate="UE %{y}<br>%{x}<br>Rate: %{z:.1%}<extra></extra>",
-            showscale=True, colorbar=dict(tickfont=dict(size=9), thickness=10),
-        ))
-        fig.update_layout(**PLOT_LAYOUT, height=300, margin=dict(t=10,b=10,l=10,r=10))
-        st.plotly_chart(fig, width='stretch')
+        if {"ue_id","load_level","consensus_anomaly"}.issubset(anomaly_df.columns):
+            hm = anomaly_df.groupby(["ue_id","load_level"])["consensus_anomaly"].mean().reset_index()
+            pivot = hm.pivot(index="ue_id", columns="load_level", values="consensus_anomaly")
+            fig = go.Figure(go.Heatmap(
+                z=pivot.values, x=[f"Load {c}" for c in pivot.columns], y=[f"UE {r}" for r in pivot.index],
+                colorscale=[[0,"#0d1420"],[0.5,"rgba(255,77,109,0.27)"],[1,"#ff4d6d"]],
+                hovertemplate="UE %{y}<br>%{x}<br>Rate: %{z:.1%}<extra></extra>",
+                showscale=True, colorbar=dict(tickfont=dict(size=9), thickness=10),
+            ))
+            fig.update_layout(**PLOT_LAYOUT, height=300, margin=dict(t=10,b=10,l=10,r=10))
+            st.plotly_chart(fig, width='stretch')
+        else:
+            st.markdown("<div style='padding:30px;text-align:center;color:var(--text-3);font-size:11px;'>ue_id / load_level / consensus_anomaly not in dataset</div>", unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown('<div class="glass-panel"><div class="glass-panel-title">🔴 Critical Event Triage — Top 20 by IF Score</div>', unsafe_allow_html=True)
-    top = df[df["severity"]=="critical"].sort_values("if_score",ascending=False).head(20)
+    if "severity" in df.columns and "if_score" in df.columns:
+        top = df[df["severity"]=="critical"].sort_values("if_score",ascending=False).head(20)
+    elif "severity" in df.columns:
+        top = df[df["severity"]=="critical"].head(20)
+    else:
+        top = df.head(20)
     cols_show = ["ue_id","timestamp","severity","if_score","ae_error","packet_loss_ratio","sinr_dl_db","throughput_mbps","if_anomaly","ae_anomaly"]
     cols_show = [c for c in cols_show if c in top.columns]
     th = "".join(f"<th>{c}</th>" for c in cols_show)
@@ -1503,6 +1831,11 @@ RC_ACTIONS = {
 
 def page_causal_root_cause(causal_df, cf_df):
     page_header("🔬","Causal Root Cause Explorer","DSO1.2 · Innovation 1 · DoWhy Causal AI · NS-3 Ground Truth")
+    if causal_df is None or len(causal_df) == 0 or "root_cause" not in causal_df.columns:
+        _empty_state("CAUSAL ROOT CAUSE", "root_cause_labels.csv missing or has no root_cause column.")
+        return
+    # Defensive copies — cf_df may be empty.
+    if cf_df is None: cf_df = pd.DataFrame()
     # Merge causal with counterfactual data — handle v1 (timestamp) and v2 (no timestamp)
     cf_merge_cols = [c for c in ["ue_id","timestamp","original_packet_loss","counterfactual_if_static","reduction_pct"] if c in cf_df.columns]
     if "timestamp" in cf_df.columns and "timestamp" in causal_df.columns:
@@ -1679,15 +2012,21 @@ def page_causal_root_cause(causal_df, cf_df):
 def page_sla_risk(sla_df):
     page_header("⚠️", "SLA Breach Risk", "DSO2.1 · XGBoost Early Warning · Member 4 (NS-3 LENA)")
 
-    if sla_df.empty:
+    if sla_df is None or sla_df.empty:
         st.warning("sla_breach_predictions.csv not found in data folder. Run Member 4's DSO2.1 notebook first and copy the output.")
+        return
+    required = {"is_high_risk_pred","risk_proba","load_level","ue_id","timestamp"}
+    missing  = required - set(sla_df.columns)
+    if missing:
+        _empty_state("SLA RISK", f"Missing columns in sla_breach_predictions.csv: {', '.join(sorted(missing))}")
         return
 
     high_risk = sla_df[sla_df["is_high_risk_pred"] == 1]
     total     = len(sla_df)
     n_risk    = len(high_risk)
     risk_rate = n_risk / total * 100 if total > 0 else 0
-    avg_prob  = round(high_risk["risk_proba"].mean() * 100, 1) if n_risk > 0 else 0
+    avg_prob_raw = high_risk["risk_proba"].mean() if n_risk > 0 else None
+    avg_prob  = round(avg_prob_raw * 100, 1) if avg_prob_raw is not None and pd.notna(avg_prob_raw) else 0
 
     c1, c2, c3, c4 = st.columns(4)
     with c1:
@@ -1704,55 +2043,64 @@ def page_sla_risk(sla_df):
 
     with col_l:
         st.markdown('<div class="glass-panel"><div class="glass-panel-title">Risk Probability Distribution</div>', unsafe_allow_html=True)
-        fig = go.Figure()
-        fig.add_trace(go.Histogram(
-            x=high_risk["risk_proba"], nbinsx=30,
-            marker_color=COLORS["critical"], opacity=0.8, name="High-Risk Events",
-        ))
-        fig.update_layout(**PLOT_LAYOUT, height=280,
-                          xaxis_title="Risk Probability", yaxis_title="Count",
-                          margin=dict(t=10, b=10, l=10, r=10))
-        st.plotly_chart(fig, use_container_width=True)
+        if n_risk == 0:
+            st.markdown("<div style='padding:30px;text-align:center;color:var(--text-3);font-size:11px;'>no high-risk events to plot</div>", unsafe_allow_html=True)
+        else:
+            fig = go.Figure()
+            fig.add_trace(go.Histogram(
+                x=high_risk["risk_proba"], nbinsx=30,
+                marker_color=COLORS["critical"], opacity=0.8, name="High-Risk Events",
+            ))
+            fig.update_layout(**PLOT_LAYOUT, height=280,
+                              xaxis_title="Risk Probability", yaxis_title="Count",
+                              margin=dict(t=10, b=10, l=10, r=10))
+            st.plotly_chart(fig, use_container_width=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
     with col_r:
         st.markdown('<div class="glass-panel"><div class="glass-panel-title">High-Risk Events by Load Level</div>', unsafe_allow_html=True)
-        by_load = high_risk.groupby("load_level").agg(
-            count=("risk_proba", "count"),
-            avg_prob=("risk_proba", "mean"),
-        ).reset_index()
-        bar_cols = [COLORS["critical"], COLORS["amber"], COLORS["cyan"]]
-        fig = go.Figure(go.Bar(
-            x=by_load["load_level"].astype(str),
-            y=by_load["count"],
-            marker_color=bar_cols[:len(by_load)],
-            text=by_load["avg_prob"].apply(lambda x: f"{x*100:.0f}%"),
-            textposition="outside",
-        ))
-        fig.update_layout(**PLOT_LAYOUT, height=280,
-                          xaxis_title="Load Level", yaxis_title="High-Risk Events",
-                          margin=dict(t=20, b=10, l=10, r=10))
-        st.plotly_chart(fig, use_container_width=True)
+        if n_risk == 0:
+            st.markdown("<div style='padding:30px;text-align:center;color:var(--text-3);font-size:11px;'>no high-risk events to break down</div>", unsafe_allow_html=True)
+        else:
+            by_load = high_risk.groupby("load_level").agg(
+                count=("risk_proba", "count"),
+                avg_prob=("risk_proba", "mean"),
+            ).reset_index()
+            bar_cols = [COLORS["critical"], COLORS["amber"], COLORS["cyan"], COLORS["emerald"], COLORS["violet"]]
+            fig = go.Figure(go.Bar(
+                x=by_load["load_level"].astype(str),
+                y=by_load["count"],
+                marker_color=bar_cols[:len(by_load)],
+                text=by_load["avg_prob"].apply(lambda x: f"{x*100:.0f}%"),
+                textposition="outside",
+            ))
+            fig.update_layout(**PLOT_LAYOUT, height=280,
+                              xaxis_title="Load Level", yaxis_title="High-Risk Events",
+                              margin=dict(t=20, b=10, l=10, r=10))
+            st.plotly_chart(fig, use_container_width=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown('<div class="glass-panel"><div class="glass-panel-title">Risk Probability Over Time — Top-4 High-Risk UEs</div>', unsafe_allow_html=True)
-    sample_ues  = high_risk["ue_id"].value_counts().head(4).index.tolist()
-    colors_seq  = [COLORS["critical"], COLORS["amber"], COLORS["cyan"], COLORS["emerald"]]
-    fig = go.Figure()
-    for i, ue in enumerate(sample_ues):
-        ue_data = sla_df[sla_df["ue_id"] == ue].sort_values("timestamp")
-        fig.add_trace(go.Scatter(
-            x=ue_data["timestamp"], y=ue_data["risk_proba"],
-            name=f"UE {ue}",
-            line=dict(color=colors_seq[i % len(colors_seq)], width=2),
-            mode="lines",
-        ))
-    fig.add_hline(y=0.5, line_dash="dash", line_color="gray",
-                  annotation_text="Decision Threshold")
-    fig.update_layout(**PLOT_LAYOUT, height=300,
-                      xaxis_title="Timestamp", yaxis_title="Risk Probability",
-                      margin=dict(t=10, b=10, l=10, r=10))
-    st.plotly_chart(fig, use_container_width=True)
+    if n_risk == 0:
+        st.markdown("<div style='padding:30px;text-align:center;color:var(--text-3);font-size:11px;'>no high-risk events</div>", unsafe_allow_html=True)
+    else:
+        sample_ues  = high_risk["ue_id"].value_counts().head(4).index.tolist()
+        colors_seq  = [COLORS["critical"], COLORS["amber"], COLORS["cyan"], COLORS["emerald"]]
+        fig = go.Figure()
+        for i, ue in enumerate(sample_ues):
+            ue_data = sla_df[sla_df["ue_id"] == ue].sort_values("timestamp")
+            fig.add_trace(go.Scatter(
+                x=ue_data["timestamp"], y=ue_data["risk_proba"],
+                name=f"UE {ue}",
+                line=dict(color=colors_seq[i % len(colors_seq)], width=2),
+                mode="lines",
+            ))
+        fig.add_hline(y=0.5, line_dash="dash", line_color="gray",
+                      annotation_text="Decision Threshold")
+        fig.update_layout(**PLOT_LAYOUT, height=300,
+                          xaxis_title="Timestamp", yaxis_title="Risk Probability",
+                          margin=dict(t=10, b=10, l=10, r=10))
+        st.plotly_chart(fig, use_container_width=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
 
@@ -1763,8 +2111,11 @@ def page_sla_risk(sla_df):
 def page_severity_triage(severity_df):
     page_header("🎯", "Severity Triage", "DSO2.3 · Random Forest + XGBoost · Member 5")
 
-    if severity_df.empty:
+    if severity_df is None or severity_df.empty:
         st.warning("severity_triage.csv not found. Run Member 5's DSO2.3 notebook first and copy outputs/severity_triage.csv to data/.")
+        return
+    if "severity_final" not in severity_df.columns:
+        _empty_state("SEVERITY TRIAGE", "severity_triage.csv is missing the severity_final column.")
         return
 
     sev_colors = {"LOW": COLORS["normal"], "MEDIUM": COLORS["amber"], "HIGH": COLORS["critical"]}
@@ -1848,9 +2199,14 @@ def page_benchmarking(bench_df):
             cc = {"Classical":COLORS["cyan"],"Supervised":COLORS["emerald"],"Deep Learning":COLORS["violet"]}
             stats = []
             for col in score_cols:
-                vals = v2_df[col].dropna()
+                vals = pd.to_numeric(v2_df[col], errors="coerce").dropna()
+                if vals.empty:
+                    stats.append({"model":mn.get(col,col),"col":col,"cat":mc.get(col,"Other"),
+                        "mean":0.0,"std":0.0,"med":0.0,"det":0.0})
+                    continue
                 stats.append({"model":mn.get(col,col),"col":col,"cat":mc.get(col,"Other"),
-                    "mean":vals.mean(),"std":vals.std(),"med":vals.median(),"det":(vals>0.5).mean()*100})
+                    "mean":float(vals.mean()),"std":float(vals.std() if len(vals) > 1 else 0.0),
+                    "med":float(vals.median()),"det":float((vals>0.5).mean()*100)})
             sdf = pd.DataFrame(stats).sort_values("mean",ascending=False)
             st.markdown('<div class="glass-panel"><div class="glass-panel-title">🎯 9-Model Anomaly Detection Comparison</div>', unsafe_allow_html=True)
             lg = "<div style='display:flex;gap:20px;margin-bottom:12px;'>"
@@ -1975,31 +2331,56 @@ def page_benchmarking(bench_df):
 def page_qos_forecast():
     page_header("🔮","QoS Forecast","DSO1.1 · XGBoost regression + Prophet confidence intervals (M2)")
 
+    # ── Window controls ──
+    cc1, cc2, cc3 = st.columns([1, 1, 2])
+    win_size = cc1.selectbox("Window", [1000, 2000, 5000, 20000, 100000],
+                             index=2, key="_qos_win",
+                             help="Latest N rows of static + live predictions")
+    src = cc2.selectbox("Source", ["auto", "static", "live"], index=0, key="_qos_src",
+                        help="auto = concat static CSV + live MLOps output")
+
     st.markdown('<div class="glass-panel"><div class="glass-panel-title">Jitter Forecast — XGBoost Predictions vs Actual</div>', unsafe_allow_html=True)
 
-    pred, pred_err = _rl_api_get("/qos/predictions?limit=2000", timeout=8.0)
+    pred, pred_err = _rl_api_get(f"/qos/predictions?limit={int(win_size)}&source={src}", timeout=10.0)
     if pred_err or not pred or "data" not in pred:
         st.warning(f"Predictions unavailable: {pred_err or 'no data'}")
         st.markdown("</div>", unsafe_allow_html=True)
     else:
+        sources = pred.get("sources") or []
+        if sources:
+            cc3.markdown(
+                f"<div style='padding-top:8px;font-family:IBM Plex Mono;font-size:10px;"
+                f"color:var(--text-3);'>📡 sources: <b style='color:var(--cyan);'>"
+                f"{' + '.join(sources)}</b> · <b>{pred.get('count',0):,}</b> rows</div>",
+                unsafe_allow_html=True)
         rows = pred.get("data", [])
         if not rows:
             st.info("No prediction rows loaded.")
         else:
             pdf = pd.DataFrame(rows)
             if "y_true" in pdf.columns and "y_pred" in pdf.columns:
+                # Coerce to numeric — API may return strings
+                pdf["y_true"] = pd.to_numeric(pdf["y_true"], errors="coerce")
+                pdf["y_pred"] = pd.to_numeric(pdf["y_pred"], errors="coerce")
+                pdf = pdf.dropna(subset=["y_true","y_pred"])
+                if pdf.empty:
+                    st.info("Predictions present but all rows non-numeric.")
+                    st.markdown("</div>", unsafe_allow_html=True)
+                    return
                 mae  = float((pdf["y_true"] - pdf["y_pred"]).abs().mean())
                 rmse = float(((pdf["y_true"] - pdf["y_pred"])**2).mean() ** 0.5)
                 denom = pdf["y_true"].replace(0, np.nan).abs()
-                mape  = float(((pdf["y_true"] - pdf["y_pred"]).abs() / denom).mean() * 100)
+                mape_val  = ((pdf["y_true"] - pdf["y_pred"]).abs() / denom).mean() * 100
+                mape_str  = "—" if pd.isna(mape_val) else f"{float(mape_val):.1f}"
+                mape_pct  = 0.0 if pd.isna(mape_val) else min(float(mape_val), 100)
 
                 c1, c2, c3, c4 = st.columns(4)
                 with c1: kpi_card("ROWS",  f"{len(pdf):,}", "",    "ok", 100)
                 with c2: kpi_card("MAE",   f"{mae:.3f}",    "ms",  "ok" if mae < 2 else "warn", min(mae*20,100))
                 with c3: kpi_card("RMSE",  f"{rmse:.3f}",   "ms",  "ok" if rmse < 3 else "warn", min(rmse*15,100))
-                with c4: kpi_card("MAPE",  f"{mape:.1f}",   "%",   "ok" if mape < 20 else "warn", min(mape, 100))
+                with c4: kpi_card("MAPE",  mape_str,        "%",   "ok" if (mape_str != "—" and float(mape_str) < 20) else "warn", mape_pct)
 
-                sample = pdf.head(300).reset_index(drop=True)
+                sample = pdf.tail(min(500, len(pdf))).reset_index(drop=True)
                 fig = go.Figure()
                 fig.add_trace(go.Scatter(y=sample["y_true"], mode="lines", name="Actual",
                                          line=dict(color=COLORS["cyan"], width=1.8)))
@@ -2203,9 +2584,25 @@ def page_rl_actions(anomaly_df, causal_df):
             if ue_options:
                 sel_ue = st.selectbox("UE to advise", ue_options, key="rl_adv_ue")
                 ue_rows = obs_src[obs_src["ue_id"] == sel_ue]
-                row = ue_rows.iloc[ue_rows["if_score"].argmax()] if "if_score" in ue_rows.columns else ue_rows.iloc[0]
-            else:
+                if ue_rows.empty:
+                    row = obs_src.iloc[0]
+                elif "if_score" in ue_rows.columns:
+                    scores = pd.to_numeric(ue_rows["if_score"], errors="coerce")
+                    if scores.notna().any():
+                        row = ue_rows.iloc[int(scores.fillna(-np.inf).argmax())]
+                    else:
+                        row = ue_rows.iloc[0]
+                else:
+                    row = ue_rows.iloc[0]
+            elif len(obs_src) > 0:
                 row = obs_src.iloc[0]
+            else:
+                row = None
+
+            if row is None:
+                st.caption("No KPI rows available to advise on.")
+                st.markdown("</div>", unsafe_allow_html=True)
+                return
 
             payload = {
                 "sinr_dl_db":        float(row["sinr_dl_db"]),
@@ -2302,32 +2699,46 @@ def page_rl_actions(anomaly_df, causal_df):
                 st.session_state["_rl_sim_result"] = sim
 
         sim = st.session_state.get("_rl_sim_result")
-        if sim:
+        if sim and isinstance(sim, dict) and "episodes" in sim and "summary" in sim:
             eps_df = pd.DataFrame(sim["episodes"])
-            summ = sim["summary"]
+            summ = sim["summary"] if isinstance(sim["summary"], dict) else {}
 
             k1, k2, k3, k4 = st.columns(4)
-            k1.metric("Mean reward", f"{summ['mean_reward']:.2f}", f"±{summ['std_reward']:.2f}")
-            k2.metric("Violations / ep", f"{summ['mean_violations']:.1f}")
-            k3.metric("Total violations", f"{summ['total_violations']}")
-            top_act = max(summ["action_mix"].items(), key=lambda kv: kv[1])
-            k4.metric("Dominant action", top_act[0], f"{top_act[1]:.0%}")
+            mean_r = summ.get("mean_reward")
+            std_r  = summ.get("std_reward")
+            k1.metric("Mean reward",
+                      f"{mean_r:.2f}" if isinstance(mean_r,(int,float)) else "—",
+                      f"±{std_r:.2f}" if isinstance(std_r,(int,float)) else None)
+            mean_v = summ.get("mean_violations")
+            k2.metric("Violations / ep",
+                      f"{mean_v:.1f}" if isinstance(mean_v,(int,float)) else "—")
+            k3.metric("Total violations", str(summ.get("total_violations", "—")))
+            action_mix = summ.get("action_mix", {})
+            if action_mix:
+                top_act = max(action_mix.items(), key=lambda kv: kv[1])
+                k4.metric("Dominant action", top_act[0], f"{top_act[1]:.0%}")
+            else:
+                k4.metric("Dominant action", "—")
 
-            fig_s = make_subplots(specs=[[{"secondary_y": True}]])
-            fig_s.add_trace(go.Scatter(
-                x=eps_df["episode"], y=eps_df["reward"], name="Reward",
-                mode="lines+markers", line=dict(color=COLORS["emerald"], width=2.5),
-                fill="tozeroy", fillcolor=hex_to_rgba(COLORS["emerald"], 0.1),
-            ), secondary_y=False)
-            fig_s.add_trace(go.Bar(
-                x=eps_df["episode"], y=eps_df["violations"], name="SLA violations",
-                marker=dict(color=hex_to_rgba(COLORS["amber"], 0.7)),
-            ), secondary_y=True)
-            fig_s.update_layout(**PLOT_LAYOUT, height=280, margin=dict(t=10,b=10,l=10,r=10),
-                                xaxis_title="Episode")
-            fig_s.update_yaxes(title_text="Reward",       secondary_y=False)
-            fig_s.update_yaxes(title_text="Violations",   secondary_y=True)
-            st.plotly_chart(fig_s, width='stretch')
+            if {"episode","reward"}.issubset(eps_df.columns):
+                fig_s = make_subplots(specs=[[{"secondary_y": True}]])
+                fig_s.add_trace(go.Scatter(
+                    x=eps_df["episode"], y=eps_df["reward"], name="Reward",
+                    mode="lines+markers", line=dict(color=COLORS["emerald"], width=2.5),
+                    fill="tozeroy", fillcolor=hex_to_rgba(COLORS["emerald"], 0.1),
+                ), secondary_y=False)
+                if "violations" in eps_df.columns:
+                    fig_s.add_trace(go.Bar(
+                        x=eps_df["episode"], y=eps_df["violations"], name="SLA violations",
+                        marker=dict(color=hex_to_rgba(COLORS["amber"], 0.7)),
+                    ), secondary_y=True)
+                fig_s.update_layout(**PLOT_LAYOUT, height=280, margin=dict(t=10,b=10,l=10,r=10),
+                                    xaxis_title="Episode")
+                fig_s.update_yaxes(title_text="Reward",       secondary_y=False)
+                fig_s.update_yaxes(title_text="Violations",   secondary_y=True)
+                st.plotly_chart(fig_s, width='stretch')
+            else:
+                st.caption("Simulation returned no per-episode trace data.")
         else:
             st.caption("Run a simulation to see per-episode reward and SLA-violation traces from the PPO agent.")
     st.markdown("</div>", unsafe_allow_html=True)
@@ -2343,6 +2754,291 @@ SUGGESTIONS = [
     "What action reduces congestion fastest?",
     "Explain QoSBuddy's business objectives.",
 ]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PAGE — LIVE NETWORK MONITOR
+# ══════════════════════════════════════════════════════════════════════════════
+
+def page_live_monitor():
+    """Real-time network monitor — live NS-3 5G Tunis simulation feed."""
+    page_header("📡", "Live Network Monitor",
+                "Real-Time NS-3 5G Simulation · 3 gNBs · 20 UEs · Tunis, Tunisia")
+
+    # ── Connection status ────────────────────────────────────────────────
+    status, err = _rl_api_get("/live/status", timeout=8.0)
+    if err:
+        st.error(f"Cannot reach API: {err}")
+        return
+
+    connected = status.get("bridge_connected", False)
+    total_rx  = status.get("total_received", 0)
+    buf_size  = status.get("buffer_size", 0)
+    last_rx   = status.get("last_received", "never")
+
+    if connected:
+        st.markdown(
+            "<div style='display:flex;align-items:center;gap:12px;padding:12px 20px;"
+            "background:rgba(0,229,160,0.08);border:1px solid rgba(0,229,160,0.3);"
+            "border-radius:12px;margin-bottom:16px;'>"
+            "<div style='width:12px;height:12px;border-radius:50%;background:#00e5a0;"
+            "box-shadow:0 0 12px #00e5a0;'></div>"
+            "<span style='font-family:IBM Plex Mono,monospace;font-size:13px;color:#00e5a0;"
+            "font-weight:600;'>BRIDGE CONNECTED — LIVE</span>"
+            f"<span style='font-size:11px;color:var(--text-3);margin-left:auto;'>"
+            f"📊 {total_rx:,} rows · 📦 {buf_size} buffered · 🕐 {last_rx}</span></div>",
+            unsafe_allow_html=True)
+    else:
+        st.markdown(
+            "<div style='display:flex;align-items:center;gap:12px;padding:12px 20px;"
+            "background:rgba(255,77,109,0.08);border:1px solid rgba(255,77,109,0.3);"
+            "border-radius:12px;margin-bottom:16px;'>"
+            "<div style='width:12px;height:12px;border-radius:50%;background:#ff4d6d;"
+            "box-shadow:0 0 12px #ff4d6d;'></div>"
+            "<span style='font-family:IBM Plex Mono,monospace;font-size:13px;color:#ff4d6d;"
+            "font-weight:600;'>BRIDGE OFFLINE</span>"
+            "<span style='font-size:11px;color:var(--text-3);margin-left:auto;'>"
+            "Waiting for bridge.py...</span></div>",
+            unsafe_allow_html=True)
+
+    if not connected and total_rx == 0:
+        st.markdown("""
+        <div class="glass-panel">
+            <div class="glass-panel-title">🔌 How to Connect the NS-3 Simulation</div>
+            <div style="font-size:13px;color:var(--text-2);line-height:1.8;">
+                <b>On the simulation machine</b> (teammate's PC):<br>
+                <code style="background:rgba(0,212,255,0.08);padding:8px 14px;border-radius:8px;
+                      display:block;font-family:IBM Plex Mono,monospace;font-size:12px;
+                      border:1px solid rgba(0,212,255,0.15);margin:8px 0;">
+                python bridge.py --csv 5g_dataset_scaled.csv --api http://YOUR_IP:8000
+                </code>
+                <b>Test locally</b> (replay existing data):<br>
+                <code style="background:rgba(0,212,255,0.08);padding:8px 14px;border-radius:8px;
+                      display:block;font-family:IBM Plex Mono,monospace;font-size:12px;
+                      border:1px solid rgba(0,212,255,0.15);margin:8px 0;">
+                python bridge.py --csv data/5g_dataset_scaled.csv --replay --speed 20
+                </code>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+        return
+
+    cr1, cr2, cr3, cr4 = st.columns([1, 1, 1, 1])
+    auto_refresh = cr1.toggle("Auto-refresh", value=True, key="_live_auto")
+    refresh_rate = cr2.selectbox("Interval", [3, 5, 10, 15, 30], index=1, key="_live_rate")
+    win_size     = cr3.selectbox("Window", [100, 300, 500, 1000, 2000], index=2, key="_live_win",
+                                 help="How many recent rows to fetch from the buffer")
+    cr4.markdown(f"<div style='padding-top:8px;font-size:11px;color:var(--text-3);'>"
+                 f"{'🔄 Every ' + str(refresh_rate) + 's · ' + str(win_size) + ' rows' if auto_refresh else '⏸ Paused'}"
+                 f"</div>", unsafe_allow_html=True)
+
+    stream, s_err = _rl_api_get(f"/live/stream?last_n={int(win_size)}", timeout=10.0)
+    if s_err or not stream or not stream.get("data"):
+        st.info("Buffer empty — waiting for data...")
+        return
+    df = pd.DataFrame(stream["data"])
+    if df.empty:
+        st.info("No data yet...")
+        return
+
+    # ── Delta tracker: how many new rows since last refresh ───────────────
+    prev_total = st.session_state.get("_live_prev_total", None)
+    delta_new  = (total_rx - prev_total) if isinstance(prev_total, int) else 0
+    st.session_state["_live_prev_total"] = int(total_rx)
+    n_anom = int(pd.to_numeric(df.get("_live_anomaly", pd.Series(dtype=int)), errors="coerce").fillna(0).sum())
+    pct_anom = (n_anom / max(len(df),1)) * 100
+
+    st.markdown(
+        f"<div style='display:flex;gap:14px;flex-wrap:wrap;margin-bottom:10px;font-family:IBM Plex Mono,monospace;font-size:11px;color:var(--text-2);'>"
+        f"<span style='padding:4px 10px;border-radius:6px;background:rgba(0,212,255,0.08);border:1px solid rgba(0,212,255,0.2);'>"
+        f"<b style='color:var(--cyan);'>+{max(delta_new,0):,}</b> new rows since last refresh</span>"
+        f"<span style='padding:4px 10px;border-radius:6px;background:rgba(0,229,160,0.08);border:1px solid rgba(0,229,160,0.2);'>"
+        f"<b style='color:var(--emerald);'>{len(df):,}</b> rows in window</span>"
+        f"<span style='padding:4px 10px;border-radius:6px;background:rgba(255,184,63,0.08);border:1px solid rgba(255,184,63,0.2);'>"
+        f"<b style='color:var(--amber);'>{n_anom:,}</b> anomalies ({pct_anom:.0f}%)</span>"
+        f"<span style='padding:4px 10px;border-radius:6px;background:rgba(167,139,250,0.08);border:1px solid rgba(167,139,250,0.2);'>"
+        f"<b style='color:var(--violet);'>{total_rx:,}</b> rows received total</span>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+    # ── KPI Cards ────────────────────────────────────────────────────────
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    def _sm(col, fmt=".2f"):
+        if col in df.columns:
+            v = pd.to_numeric(df[col], errors="coerce").mean()
+            return f"{v:{fmt}}" if pd.notna(v) else "—"
+        return "—"
+    with c1: kpi_card("LIVE ROWS", str(len(df)), "", "ok", 100)
+    with c2:
+        v = _sm("packet_loss_ratio", ".3f")
+        sev = "crit" if v != "—" and float(v) > 0.3 else "ok"
+        kpi_card("PKT LOSS", v, "ratio", sev, min(float(v)*200 if v != "—" else 0, 100))
+    with c3: kpi_card("SINR", _sm("sinr_dl_db", ".1f"), "dB", "ok", 60)
+    with c4: kpi_card("THROUGHPUT", _sm("throughput_mbps", ".2f"), "Mbps", "ok", 50)
+    with c5:
+        v = _sm("delay_ms", ".1f")
+        if v == "—":
+            sev = "ok"
+        else:
+            fv = float(v)
+            sev = "crit" if fv > 250 else "warn" if fv > 100 else "ok"
+        kpi_card("DELAY", v, "ms", sev, min(float(v)/5 if v != "—" else 0, 100))
+    with c6:
+        if "_live_anomaly" in df.columns:
+            ar_raw = pd.to_numeric(df["_live_anomaly"], errors="coerce").mean()
+            ar = float(ar_raw) * 100 if pd.notna(ar_raw) else 0.0
+            sev = "crit" if ar > 30 else "warn" if ar > 15 else "ok"
+            kpi_card("ANOMALY", f"{ar:.1f}", "%", sev, min(ar * 2, 100))
+        else:
+            kpi_card("ANOMALY", "—", "%", "ok", 0)
+
+    # ── LIVE MAP — Tunis 5G Network ──────────────────────────────────────
+    if "ue_lat" in df.columns and "ue_lon" in df.columns:
+        st.markdown('<div class="glass-panel"><div class="glass-panel-title">'
+                    '🗺️ Live Network Map — Tunis 5G Coverage</div>', unsafe_allow_html=True)
+        for nc in ["ue_lat", "ue_lon", "packet_loss_ratio", "sinr_dl_db"]:
+            if nc in df.columns: df[nc] = pd.to_numeric(df[nc], errors="coerce")
+        latest = df.groupby("ue_id").tail(1).copy() if "ue_id" in df.columns else df.tail(20).copy()
+
+        def _ue_color(row):
+            loss = row.get("packet_loss_ratio", 0)
+            anom = row.get("_live_anomaly", 0)
+            if anom == 1 or (isinstance(loss, (int, float)) and loss > 0.5): return "#ff4d6d"
+            elif isinstance(loss, (int, float)) and loss > 0.2: return "#ffb83f"
+            return "#00e5a0"
+
+        latest["_hex"] = latest.apply(_ue_color, axis=1)
+        latest["_size"] = latest.apply(lambda r: 14 if r.get("_live_anomaly", 0) == 1 else 9, axis=1)
+
+        def _hover(r):
+            p = [f"<b>{r.get('ue_name', 'UE '+str(r.get('ue_id','?')))}</b>"]
+            p.append(f"gNB: {r.get('gnb_name', '?')}")
+            for k, l, f in [("packet_loss_ratio","Loss",".3f"),("sinr_dl_db","SINR",".1f dB"),
+                             ("throughput_mbps","Tput",".2f Mbps"),("delay_ms","Delay",".0f ms")]:
+                if k in r and pd.notna(r[k]): p.append(f"{l}: {r[k]:{f.split()[0]}}{' '+f.split()[1] if len(f.split())>1 else ''}")
+            if "_rl_action" in r and r["_rl_action"] != "unknown": p.append(f"RL: {r['_rl_action']}")
+            if "_live_anomaly" in r: p.append("⚠️ ANOMALY" if r["_live_anomaly"] == 1 else "✅ Normal")
+            return "<br>".join(p)
+
+        latest["_hover"] = latest.apply(_hover, axis=1)
+
+        fig_map = go.Figure()
+        fig_map.add_trace(go.Scattermapbox(
+            lat=latest["ue_lat"], lon=latest["ue_lon"], mode="markers+text",
+            marker=dict(size=latest["_size"], color=latest["_hex"], opacity=0.9),
+            text=latest.get("ue_name", latest.get("ue_id", "")),
+            textposition="top right", textfont=dict(size=8, color="white"),
+            hovertext=latest["_hover"], hoverinfo="text", name="UEs",
+        ))
+        if "gnb_lat" in df.columns and "gnb_lon" in df.columns:
+            gnbs = df[["gnb_id","gnb_name","gnb_lat","gnb_lon"]].drop_duplicates()
+            for nc in ["gnb_lat","gnb_lon"]: gnbs[nc] = pd.to_numeric(gnbs[nc], errors="coerce")
+            gnbs = gnbs.dropna(subset=["gnb_lat","gnb_lon"])
+            fig_map.add_trace(go.Scattermapbox(
+                lat=gnbs["gnb_lat"], lon=gnbs["gnb_lon"], mode="markers+text",
+                marker=dict(size=18, color="#00d4ff", symbol="circle", opacity=0.95),
+                text=gnbs["gnb_name"], textposition="bottom center",
+                textfont=dict(size=9, color="#00d4ff", family="IBM Plex Mono"),
+                hovertext=gnbs["gnb_name"].apply(lambda n: f"<b>📡 {n}</b><br>Base Station"),
+                hoverinfo="text", name="gNB Towers",
+            ))
+        _clat_m = latest["ue_lat"].mean()
+        _clon_m = latest["ue_lon"].mean()
+        clat = float(_clat_m) if pd.notna(_clat_m) else 36.84
+        clon = float(_clon_m) if pd.notna(_clon_m) else 10.19
+        fig_map.update_layout(
+            mapbox=dict(style="open-street-map", center=dict(lat=clat, lon=clon), zoom=12.5),
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            margin=dict(t=0,b=0,l=0,r=0), height=420, showlegend=True,
+            legend=dict(bgcolor="rgba(5,10,20,0.7)", font=dict(color="#e8f0fe",size=10), x=0.01, y=0.99),
+        )
+        st.plotly_chart(fig_map, use_container_width=True)
+        st.markdown(
+            "<div style='display:flex;gap:20px;justify-content:center;margin-top:4px;'>"
+            "<span style='display:inline-flex;align-items:center;gap:6px;'><span style='width:10px;height:10px;border-radius:50%;background:#00e5a0;'></span><span style='font-size:10px;color:var(--text-3);'>Normal</span></span>"
+            "<span style='display:inline-flex;align-items:center;gap:6px;'><span style='width:10px;height:10px;border-radius:50%;background:#ffb83f;'></span><span style='font-size:10px;color:var(--text-3);'>Degraded</span></span>"
+            "<span style='display:inline-flex;align-items:center;gap:6px;'><span style='width:10px;height:10px;border-radius:50%;background:#ff4d6d;'></span><span style='font-size:10px;color:var(--text-3);'>Anomaly</span></span>"
+            "<span style='display:inline-flex;align-items:center;gap:6px;'><span style='width:10px;height:10px;border-radius:50%;background:#00d4ff;'></span><span style='font-size:10px;color:var(--text-3);'>gNB Tower</span></span>"
+            "</div>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    # ── LIVE KPI TIME SERIES ─────────────────────────────────────────────
+    st.markdown('<div class="glass-panel"><div class="glass-panel-title">📊 Live KPI Time Series</div>', unsafe_allow_html=True)
+    if "_server_ts" in df.columns: df["_x"] = pd.to_datetime(df["_server_ts"], unit="s")
+    elif "timestamp" in df.columns: df["_x"] = df["timestamp"]
+    else: df["_x"] = range(len(df))
+    kpi_cols = [c for c in ["packet_loss_ratio","sinr_dl_db","throughput_mbps","delay_ms","jitter_ms"] if c in df.columns]
+    kc = {"packet_loss_ratio":COLORS["critical"],"sinr_dl_db":COLORS["cyan"],"throughput_mbps":COLORS["emerald"],"delay_ms":COLORS["amber"],"jitter_ms":COLORS["violet"]}
+    if kpi_cols:
+        tabs = st.tabs([c.replace("_"," ").title() for c in kpi_cols])
+        for tab, col in zip(tabs, kpi_cols):
+            with tab:
+                vals = pd.to_numeric(df[col], errors="coerce")
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(x=df["_x"], y=vals, mode="lines", line=dict(color=kc.get(col,COLORS["cyan"]),width=2), fill="tozeroy", fillcolor=hex_to_rgba(kc.get(col,COLORS["cyan"]),0.08), name=col))
+                if "_live_anomaly" in df.columns:
+                    am = df["_live_anomaly"]==1
+                    if am.any(): fig.add_trace(go.Scatter(x=df.loc[am,"_x"], y=vals[am], mode="markers", marker=dict(color=COLORS["critical"],size=8,symbol="triangle-up",line=dict(width=1,color="white")), name="Anomaly"))
+                fig.update_layout(**PLOT_LAYOUT, height=280, margin=dict(t=10,b=10,l=10,r=10), showlegend=True, legend=dict(orientation="h",y=1.1))
+                st.plotly_chart(fig, use_container_width=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # ── RL AGENT LIVE ────────────────────────────────────────────────────
+    if "_rl_action" in df.columns:
+        st.markdown('<div class="glass-panel"><div class="glass-panel-title">🤖 RL Agent — Live Actions</div>', unsafe_allow_html=True)
+        ac = df["_rl_action"].value_counts()
+        acol = {"reroute":COLORS["cyan"],"throttle":COLORS["amber"],"prioritize":COLORS["emerald"],"no_action":COLORS["violet"],"unknown":COLORS["critical"]}
+        c1,c2 = st.columns([1,2])
+        with c1:
+            fig = go.Figure(go.Pie(labels=ac.index.tolist(), values=ac.values.tolist(), marker=dict(colors=[acol.get(a,COLORS["cyan"]) for a in ac.index]), hole=0.55, textinfo="label+percent", textfont=dict(size=10)))
+            fig.update_layout(**PLOT_LAYOUT, height=260, margin=dict(t=10,b=10,l=10,r=10), showlegend=False)
+            st.plotly_chart(fig, use_container_width=True)
+        with c2:
+            amap = {"reroute":0,"throttle":1,"prioritize":2,"no_action":3}
+            fig2 = go.Figure()
+            fig2.add_trace(go.Scatter(x=df["_x"], y=df["_rl_action"].map(amap).fillna(-1), mode="markers+lines", marker=dict(color=[acol.get(a,COLORS["cyan"]) for a in df["_rl_action"]],size=6), line=dict(color="rgba(0,212,255,0.2)",width=1), hovertext=df["_rl_action"], hoverinfo="text"))
+            fig2.update_layout(**PLOT_LAYOUT, height=260, margin=dict(t=10,b=10,l=10,r=10))
+            fig2.update_yaxes(tickvals=[0,1,2,3], ticktext=["reroute","throttle","prioritize","no_action"])
+            st.plotly_chart(fig2, use_container_width=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    # ── ANOMALY SCORES ───────────────────────────────────────────────────
+    if "_live_scores" in df.columns:
+        st.markdown('<div class="glass-panel"><div class="glass-panel-title">🎯 Live Anomaly Scores</div>', unsafe_allow_html=True)
+        sdf = pd.json_normalize(df["_live_scores"].apply(lambda x: x if isinstance(x,dict) else {}))
+        if not sdf.empty and len(sdf.columns) > 0:
+            for sc in sdf.columns: sdf[sc] = pd.to_numeric(sdf[sc], errors="coerce")
+            mcm = {"isolation_forest":COLORS["cyan"],"random_forest":COLORS["emerald"],"gradient_boosting":COLORS["amber"]}
+            fig = go.Figure()
+            for sc in sdf.columns: fig.add_trace(go.Scatter(x=df["_x"], y=sdf[sc], mode="lines", name=sc.replace("_"," ").title(), line=dict(color=mcm.get(sc,COLORS["violet"]),width=1.5)))
+            fig.add_hline(y=0.5, line=dict(color=COLORS["critical"],dash="dash",width=1), annotation_text="Threshold")
+            fig.update_layout(**PLOT_LAYOUT, height=280, margin=dict(t=10,b=10,l=10,r=10), legend=dict(orientation="h",y=1.1))
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.markdown("<div style='padding:30px;text-align:center;color:var(--text-3);font-size:11px;'>no model scores attached to live rows</div>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    # ── PER-UE TABLE ─────────────────────────────────────────────────────
+    if "ue_id" in df.columns and "ue_name" in df.columns:
+        with st.expander("📋 Per-UE Live Status", expanded=False):
+            uel = df.groupby("ue_id").tail(1)
+            sc = [c for c in ["ue_id","ue_name","gnb_name","sinr_dl_db","throughput_mbps","delay_ms","packet_loss_ratio","load_level","ue_dist_to_gnb_m","_rl_action","_live_anomaly"] if c in uel.columns]
+            st.dataframe(uel[sc].reset_index(drop=True), use_container_width=True, height=400)
+
+    with st.expander("📋 Raw Live Data (latest 50)", expanded=False):
+        sc2 = [c for c in ["timestamp","ue_id","ue_name","gnb_name","sinr_dl_db","throughput_mbps","delay_ms","jitter_ms","packet_loss_ratio","load_level","_rl_action","_live_anomaly"] if c in df.columns]
+        st.dataframe(df[sc2].tail(50).reset_index(drop=True), use_container_width=True, height=300)
+
+    # ── Auto-refresh ─────────────────────────────────────────────────────
+    # Streamlit doesn't loop on its own — the previous gating-on-elapsed-time
+    # logic never triggered because the script returned to idle immediately.
+    # Sleep then explicit rerun forces a real periodic re-fetch + redraw.
+    if auto_refresh:
+        import time as _time
+        _time.sleep(refresh_rate)
+        st.rerun()
+
 
 def page_rag_chat():
     page_header("💬","Ask the Network","DSO3.2 · RAG Engine · ChromaDB + Ollama llama3.2 · NOC Intelligence")
@@ -2376,11 +3072,16 @@ def page_rag_chat():
     if user_input:
         with st.spinner(""):
             if rag_ready:
-                from rag.rag_pipeline import query_rag
-                result = query_rag(question=user_input, collection=collection,
-                                   embed_model=embed_model, chain=chain, mode=mode,
-                                   severity_filter=sev_flt, root_cause_filter=rc_flt)
-                answer, sources = result["answer"], result["sources"]
+                try:
+                    from rag.rag_pipeline import query_rag
+                    result = query_rag(question=user_input, collection=collection,
+                                       embed_model=embed_model, chain=chain, mode=mode,
+                                       severity_filter=sev_flt, root_cause_filter=rc_flt)
+                    answer  = result.get("answer", "(empty answer)") if isinstance(result, dict) else str(result)
+                    sources = result.get("sources", []) if isinstance(result, dict) else []
+                except Exception as e:
+                    answer  = f"⚠️ RAG query failed: {e}. Check that Ollama is reachable."
+                    sources = []
             else:
                 answer  = "⚠️ RAG pipeline not initialised. Run `python rag/build_knowledge_base.py` first."
                 sources = []
@@ -2394,17 +3095,26 @@ def page_rag_chat():
           <div class="chat-meta">You · {ts}</div>
           {turn['question']}
         </div>""", unsafe_allow_html=True)
+        _ans = turn.get('answer','') or ''
         st.markdown(f"""
         <div class="chat-bubble chat-bot">
-          <div class="chat-meta">QoSBuddy NOC Assistant · {len(turn['sources'])} sources</div>
-          {turn['answer'].replace(chr(10),'<br>')}
+          <div class="chat-meta">QoSBuddy NOC Assistant · {len(turn.get('sources') or [])} sources</div>
+          {_ans.replace(chr(10),'<br>')}
         </div>""", unsafe_allow_html=True)
-        if turn["sources"]:
-            with st.expander(f"📚 {len(turn['sources'])} retrieved sources"):
+        srcs = turn.get("sources") or []
+        if srcs:
+            with st.expander(f"📚 {len(srcs)} retrieved sources"):
                 items = ""
-                for s in turn["sources"]:
-                    m = s["metadata"]
-                    items += f"""<div class="chat-source-item"><span class="src-badge">{m.get('doc_type','?')[:8]}</span><span class="src-sim">sim={s['similarity']:.3f}</span><span>sev={m.get('severity','—')}</span><span>rc={m.get('root_cause','—')}</span></div>"""
+                for s in srcs:
+                    if not isinstance(s, dict): continue
+                    m = s.get("metadata") or {}
+                    sim = s.get("similarity")
+                    sim_str = f"{sim:.3f}" if isinstance(sim,(int,float)) else "—"
+                    items += (f"""<div class="chat-source-item">"""
+                              f"""<span class="src-badge">{(m.get('doc_type','?') or '?')[:8]}</span>"""
+                              f"""<span class="src-sim">sim={sim_str}</span>"""
+                              f"""<span>sev={m.get('severity','—')}</span>"""
+                              f"""<span>rc={m.get('root_cause','—')}</span></div>""")
                 st.markdown(f'<div class="chat-sources-wrap">{items}</div>', unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -4552,7 +5262,7 @@ def page_voice_assistant():
 
     st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Syne:wght@700;800&family=IBM+Plex+Mono:wght@300;400&display=swap');
+/* fonts loaded via system fallbacks */
 .vp-hud{display:flex;align-items:center;justify-content:space-between;
   padding:8px 0 16px;border-bottom:1px solid rgba(0,212,255,0.1);margin-bottom:16px;}
 .vp-hud-title{font-family:'Syne',sans-serif;font-size:22px;font-weight:800;
@@ -4816,13 +5526,17 @@ def page_voice_assistant():
         push_state("processing")
         with st.spinner("\u26a1 Querying RAG pipeline..."):
             if rag_ready:
-                from rag.rag_pipeline import query_rag
-                result = query_rag(
-                    question=question, collection=collection,
-                    embed_model=embed_model, chain=chain,
-                    mode=mode, severity_filter=sev_flt, root_cause_filter=rc_flt)
-                answer  = result["answer"]
-                sources = result["sources"]
+                try:
+                    from rag.rag_pipeline import query_rag
+                    result = query_rag(
+                        question=question, collection=collection,
+                        embed_model=embed_model, chain=chain,
+                        mode=mode, severity_filter=sev_flt, root_cause_filter=rc_flt)
+                    answer  = result.get("answer", "(empty answer)") if isinstance(result, dict) else str(result)
+                    sources = result.get("sources", []) if isinstance(result, dict) else []
+                except Exception as e:
+                    answer  = f"\u26a0\ufe0f RAG query failed: {e}. Check that Ollama is reachable."
+                    sources = []
             else:
                 answer  = "\u26a0\ufe0f RAG not initialised. Run build_knowledge_base.py first."
                 sources = []
@@ -4866,9 +5580,12 @@ def page_voice_assistant():
                    "SLA_RISK":"#ffb83f","DOMAIN_CONTEXT":"#a78bfa"}
         badges = ""
         for s in src_list[:6]:
-            m  = s["metadata"]
-            dt = m.get("doc_type","?")
+            if not isinstance(s, dict): continue
+            m  = s.get("metadata") or {}
+            dt = m.get("doc_type","?") or "?"
             bc = COL_MAP.get(dt,"#00d4ff")
+            sim = s.get("similarity")
+            sim_str = f"{sim:.2f}" if isinstance(sim,(int,float)) else "—"
             badges += (
                 f"<span style='display:inline-flex;align-items:center;gap:5px;"
                 f"background:rgba(0,0,0,.3);border:1px solid {bc}33;"
@@ -4878,7 +5595,7 @@ def page_voice_assistant():
                 f"<span style='font-family:IBM Plex Mono,monospace;font-size:9px;"
                 f"color:{bc};'>{_e(dt[:12])}</span>"
                 f"<span style='font-size:9px;color:rgba(200,220,255,.4);'>"
-                f"sim={s['similarity']:.2f}</span></span>"
+                f"sim={sim_str}</span></span>"
             )
 
         src_block = (
@@ -4997,14 +5714,26 @@ def _make_pdf(title, anomaly_df, causal_df, include_chat, include_raw):
     story.append(Paragraph(f"PingWin · ESPRIT · DSO3.2  |  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", body_s))
     story.append(HRFlowable(width="100%", color=BLUE, thickness=2, spaceAfter=10))
     story.append(Paragraph("Network KPI Summary", h1_s))
-    df = anomaly_df
+    df = anomaly_df if anomaly_df is not None else pd.DataFrame()
+
+    # Schema-defensive KPI extraction — works for both v1 (raw KPIs) and v2 (scores).
+    def _kpi_row(label, col, fmt, scale, hi_test, hi_label="HIGH", ok_label="OK"):
+        if col not in df.columns or len(df) == 0:
+            return [label, "—", "no data"]
+        v = pd.to_numeric(df[col], errors="coerce").mean()
+        if pd.isna(v): return [label, "—", "no data"]
+        v_s = float(v) * scale
+        return [label, fmt.format(v_s), hi_label if hi_test(float(v)) else ok_label]
+
     kd = [["KPI","Value","Status"],
-          ["Avg Jitter (ms)", f"{df['jitter_ms'].mean():.2f}", "ELEVATED" if df['jitter_ms'].mean()>10 else "OK"],
-          ["Avg Packet Loss",  f"{df['packet_loss_ratio'].mean()*100:.1f}%", "HIGH" if df['packet_loss_ratio'].mean()>0.3 else "OK"],
-          ["Avg Throughput",   f"{df['throughput_mbps'].mean():.3f} Mbps", "LOW" if df['throughput_mbps'].mean()<2 else "OK"],
-          ["Avg Delay (ms)",   f"{df['delay_ms'].mean():.1f}", "HIGH" if df['delay_ms'].mean()>100 else "OK"],
-          ["Anomaly Rate",     f"{df['if_anomaly'].mean()*100:.1f}%", "HIGH" if df['if_anomaly'].mean()>0.3 else "OK"],
-          ["Critical Events",  f"{(df['severity']=='critical').sum():,}", ""]]
+          _kpi_row("Avg Jitter (ms)",  "jitter_ms",         "{:.2f}",       1,   lambda v: v > 10,  "ELEVATED"),
+          _kpi_row("Avg Packet Loss",  "packet_loss_ratio", "{:.1f}%",      100, lambda v: v > 0.3, "HIGH"),
+          _kpi_row("Avg Throughput",   "throughput_mbps",   "{:.3f} Mbps",  1,   lambda v: v < 2,   "LOW"),
+          _kpi_row("Avg Delay (ms)",   "delay_ms",          "{:.1f}",       1,   lambda v: v > 100, "HIGH"),
+          _kpi_row("Anomaly Rate",     "if_anomaly",        "{:.1f}%",      100, lambda v: v > 0.3, "HIGH"),
+          ["Critical Events",
+           f"{int((df['severity']=='critical').sum()):,}" if "severity" in df.columns else "—",
+           ""]]
     kt = Table(kd, colWidths=[6*cm,4*cm,5*cm])
     kt.setStyle(TableStyle([
         ("BACKGROUND",(0,0),(-1,0),BLUE), ("TEXTCOLOR",(0,0),(-1,0),colors.white),
@@ -5052,12 +5781,29 @@ def _make_pdf(title, anomaly_df, causal_df, include_chat, include_raw):
             story.append(Spacer(1,6))
     if include_raw:
         story.append(Paragraph("Critical Anomaly Sample", h1_s))
-        top = anomaly_df[anomaly_df["severity"]=="critical"].head(15)
-        c_show = ["ue_id","timestamp","severity","if_score","packet_loss_ratio","sinr_dl_db"]
-        raw = [c_show] + top[c_show].round(3).values.tolist()
-        raw_t = Table(raw)
-        raw_t.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),colors.HexColor("#080c12")),("TEXTCOLOR",(0,0),(-1,0),colors.white),("FONTSIZE",(0,0),(-1,-1),7),("GRID",(0,0),(-1,-1),0.3,colors.grey),("PADDING",(0,0),(-1,-1),4)]))
-        story.append(raw_t)
+        # Pick whichever critical-event subset we can build from the available schema.
+        if anomaly_df is not None and "severity" in anomaly_df.columns:
+            top = anomaly_df[anomaly_df["severity"]=="critical"].head(15)
+        elif anomaly_df is not None and "true_label" in anomaly_df.columns:
+            top = anomaly_df[anomaly_df["true_label"]==1].head(15)
+        else:
+            top = anomaly_df.head(15) if anomaly_df is not None else pd.DataFrame()
+        c_show = [c for c in ["ue_id","timestamp","window_idx","severity","true_label",
+                              "if_score","packet_loss_ratio","sinr_dl_db"] if c in top.columns]
+        if not top.empty and c_show:
+            try:
+                _slice = top[c_show].copy()
+                # round only numeric cols
+                for c in _slice.select_dtypes(include=[np.number]).columns:
+                    _slice[c] = _slice[c].round(3)
+                raw = [c_show] + _slice.astype(str).values.tolist()
+                raw_t = Table(raw)
+                raw_t.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),colors.HexColor("#080c12")),("TEXTCOLOR",(0,0),(-1,0),colors.white),("FONTSIZE",(0,0),(-1,-1),7),("GRID",(0,0),(-1,-1),0.3,colors.grey),("PADDING",(0,0),(-1,-1),4)]))
+                story.append(raw_t)
+            except Exception as e:
+                story.append(Paragraph(f"(critical-anomaly sample unavailable: {e})", body_s))
+        else:
+            story.append(Paragraph("(no critical-anomaly rows in current dataset)", body_s))
     doc.build(story)
     return buf.getvalue()
 
@@ -5067,14 +5813,22 @@ def _make_pdf(title, anomaly_df, causal_df, include_chat, include_raw):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    anomaly_df  = load_anomaly_df()
-    causal_df   = load_causal_df()
-    cf_df       = load_cf_df()
-    sla_df      = load_sla_df()
-    severity_df = load_severity_df()
-    bench_df    = load_bench_df()
+    anomaly_static = load_anomaly_df()
+    causal_df      = load_causal_df()
+    cf_df          = load_cf_df()
+    sla_df         = load_sla_df()
+    severity_df    = load_severity_df()
+    bench_df       = load_bench_df()
 
-    for key, default in [("page","voice"),("sev_f",None),("ue_f",None),("chat_history",[]),("theme","dark")]:
+    # Live-data promotion: when the bridge has streamed enough rows, swap the
+    # static anomaly_df for the live buffer so other pages reflect real-time state.
+    anomaly_df = get_active_anomaly_df(anomaly_static)
+
+    # Restore page from URL on hard refresh; valid keys come from NAV_ITEMS.
+    _url_page = st.query_params.get("page")
+    _valid_pages = {k for k, _, _ in NAV_ITEMS}
+    _default_page = _url_page if _url_page in _valid_pages else "voice"
+    for key, default in [("page",_default_page),("sev_f",None),("ue_f",None),("chat_history",[]),("theme","dark")]:
         if key not in st.session_state:
             st.session_state[key] = default
 
@@ -5088,6 +5842,7 @@ def main():
     elif page == "benchmark":  page_benchmarking(bench_df)
     elif page == "forecast":   page_qos_forecast()
     elif page == "rl":         page_rl_actions(anomaly_df, causal_df)
+    elif page == "live_monitor": page_live_monitor()
     elif page == "chat":       page_rag_chat()
     elif page == "voice":      page_voice_assistant()
     elif page == "export":     page_export_report(anomaly_df, causal_df)

@@ -1,6 +1,5 @@
 @echo off
-chcp 65001 >nul 2>&1
-title QoSBuddy — Stopping...
+title QoSBuddy - Stopping...
 color 0E
 
 echo.
@@ -16,6 +15,7 @@ if exist "%SCRIPT_DIR%docker-compose.yml" (
 ) else if exist "D:\QosBuddy\qosbuddy_m6\docker\docker-compose.yml" (
     cd /d "D:\QosBuddy\qosbuddy_m6\docker\"
 ) else (
+    color 0C
     echo  [ERROR] Could not find docker-compose.yml
     echo  Make sure the project is at D:\QosBuddy\qosbuddy_m6\docker\
     pause
@@ -23,6 +23,15 @@ if exist "%SCRIPT_DIR%docker-compose.yml" (
 )
 
 docker compose down
+
+if errorlevel 1 (
+    color 0C
+    echo.
+    echo  [ERROR] Docker Compose down failed. Check the messages above.
+    echo.
+    pause
+    exit /b 1
+)
 
 color 0A
 echo.
